@@ -444,6 +444,41 @@ async def get_allowed_tags():
     return [t.value for t in TagEnum]
 
 
+# ============== Bulk Operations (N+1 fix) ==============
+
+@router.post("/nodes/bulk")
+async def get_nodes_bulk(node_ids: List[str]):
+    """
+    Получение метаданных нескольких узлов за 1 запрос.
+
+    Решение N+1 для навигации: агент запрашивает 50 узлов
+    одним вызовом вместо 50 отдельных GET /node/{id}.
+    """
+    s = get_storage()
+    nodes = s.get_nodes_bulk(node_ids)
+    return [n.to_api_dict(include_code=False) for n in nodes]
+
+
+@router.post("/nodes/bulk/code")
+async def get_nodes_code_bulk(node_ids: List[str]):
+    """
+    Получение кода нескольких узлов за 1 запрос.
+    Для случаев когда агент уже решил что ему нужны конкретные файлы.
+    """
+    s = get_storage()
+    nodes = s.get_nodes_bulk(node_ids)
+    return [
+        {
+            "node_id": n.node_id,
+            "source_code": n.source_code,
+            "file_path": n.file_path,
+            "line_start": n.line_start,
+            "line_end": n.line_end,
+        }
+        for n in nodes
+    ]
+
+
 # ============== Phase C: Vector Search ==============
 
 @router.post("/search/vector")
@@ -526,8 +561,11 @@ async def index_embeddings():
 @router.post("/generate/summaries")
 async def generate_summaries():
     """
-    Генерирует summary для всех узлов без summary через LLM.
-    Выполняется при индексации, НЕ при навигации.
+    Батч-генерация summary для всех узлов через LLM.
+
+    Решение N+1: вместо 1 API-вызова на узел отправляем
+    пачки по 30 узлов за 1 вызов. 100K узлов = ~3.3K вызовов
+    вместо 100K (30x экономия токенов и времени).
     """
     from ..llm.client import get_llm_client
     s = get_storage()
@@ -536,30 +574,38 @@ async def generate_summaries():
     if not client.api_key:
         raise HTTPException(status_code=503, detail="LLM not configured")
 
-    all_nodes = s.search_nodes(limit=1000)
+    all_nodes = s.search_nodes(limit=100000)
+
+    # Фильтруем: только узлы без осмысленного summary и с кодом
+    needs_summary = [
+        n for n in all_nodes
+        if n.source_code
+        and (not n.summary or n.summary.startswith(("Class ", "Function ", "Document")))
+    ]
+
+    if not needs_summary:
+        return {"updated": 0, "total_nodes": len(all_nodes), "api_calls": 0}
+
+    # Батч-генерация: 30 узлов за 1 LLM-вызов
+    summaries = await client.batch_summarize(needs_summary, batch_size=30)
+
+    # Запись в Neo4j
     updated = 0
-
-    for node in all_nodes:
-        # Пропускаем если summary уже осмысленный (не автогенерированный шаблон)
-        if node.summary and not node.summary.startswith(("Class ", "Function ", "Document")):
-            continue
-        if not node.source_code:
-            continue
-
-        code_snippet = node.source_code[:500]  # Первые 500 символов
-        prompt = (
-            f"Describe this {node.type} in one sentence (max 100 chars). "
-            f"Name: {node.name}\n\nCode:\n{code_snippet}"
-        )
-
-        summary = await client.generate(prompt, system="Be concise. Respond with only the description.")
-        if summary:
-            summary = summary.strip()[:200]
-            node.summary = summary
+    for node in needs_summary:
+        if node.node_id in summaries:
+            node.summary = summaries[node.node_id]
             s.update_node(node)
             updated += 1
 
-    return {"updated": updated, "total_nodes": len(all_nodes)}
+    import math
+    api_calls = math.ceil(len(needs_summary) / 30)
+
+    return {
+        "updated": updated,
+        "total_nodes": len(all_nodes),
+        "api_calls": api_calls,
+        "savings": f"{len(needs_summary)} nodes in {api_calls} calls instead of {len(needs_summary)}"
+    }
 
 
 # ============== Phase C: Shadow Graph (Virtual Patches) ==============

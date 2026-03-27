@@ -206,11 +206,50 @@ async def get_embedding(text: str, api_key: str = None) -> Optional[List[float]]
 
 async def get_embeddings_batch(
     texts: List[str],
-    api_key: str = None
+    api_key: str = None,
+    batch_size: int = 100,
 ) -> List[Optional[List[float]]]:
-    """Батч-генерация эмбеддингов (последовательно, Gemini не поддерживает batch)"""
-    results = []
-    for text in texts:
-        emb = await get_embedding(text, api_key)
-        results.append(emb)
+    """
+    Батч-генерация эмбеддингов через Gemini batchEmbedContents API.
+
+    Решение N+1: вместо 1 HTTP-вызова на текст отправляем
+    пачки по batch_size (до 100) за 1 вызов.
+    100K узлов = ~1K вызовов вместо 100K (100x экономия).
+    """
+    settings = get_settings()
+    key = api_key or settings.llm_api_key
+    if not key:
+        return [None] * len(texts)
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-embedding-001:batchEmbedContents?key={key}"
+    )
+    model = "models/gemini-embedding-001"
+
+    results: List[Optional[List[float]]] = []
+
+    async with aiohttp.ClientSession() as session:
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i:i + batch_size]
+            payload = {
+                "requests": [
+                    {"content": {"parts": [{"text": t}]}, "model": model}
+                    for t in chunk
+                ]
+            }
+            try:
+                async with session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        error = await resp.text()
+                        logger.error(f"Batch embedding error {resp.status}: {error}")
+                        results.extend([None] * len(chunk))
+                        continue
+                    data = await resp.json()
+                    for emb in data.get("embeddings", []):
+                        results.append(emb.get("values"))
+            except Exception as e:
+                logger.error(f"Batch embedding failed: {e}")
+                results.extend([None] * len(chunk))
+
     return results

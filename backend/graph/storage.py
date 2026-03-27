@@ -153,6 +153,19 @@ class Neo4jStorage:
             record = result.single()
             return record and record["deleted"] > 0
     
+    def get_nodes_bulk(self, node_ids: List[str]) -> List[GraphNode]:
+        """Получение нескольких узлов за 1 Cypher-запрос (решение N+1)"""
+        if not node_ids:
+            return []
+        cypher = """
+        MATCH (n:Node)
+        WHERE n.node_id IN $node_ids
+        RETURN n
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, node_ids=node_ids)
+            return [GraphNode.from_dict(dict(record["n"])) for record in result]
+
     def update_node(self, node: GraphNode) -> bool:
         """Обновление свойств существующего узла"""
         cypher = """

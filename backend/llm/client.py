@@ -157,6 +157,71 @@ class LLMClient:
             return data["content"][0]["text"]
 
 
+    async def batch_summarize(
+        self,
+        nodes: list,
+        batch_size: int = 30,
+    ) -> dict:
+        """
+        Батч-генерация summary для множества узлов.
+
+        Вместо N API-вызовов (1 на узел) делаем ceil(N/batch_size) вызовов.
+        Один промпт содержит до batch_size узлов, LLM возвращает
+        JSON-массив summary для всех сразу.
+
+        100K узлов: вместо 100K вызовов → ~3.3K вызовов (30x экономия).
+
+        Returns:
+            {node_id: summary_text, ...}
+        """
+        results = {}
+
+        for i in range(0, len(nodes), batch_size):
+            batch = nodes[i:i + batch_size]
+
+            # Формируем блок для LLM
+            entries = []
+            for idx, node in enumerate(batch):
+                code = (node.source_code or "")[:300]
+                entries.append(
+                    f"[{idx}] type={node.type} name={node.name}\n"
+                    f"code: {code}"
+                )
+
+            prompt = (
+                "For each code element below, write a ONE-sentence summary (max 80 chars).\n"
+                "Return ONLY a JSON array of strings, one per element, in order.\n"
+                "Example: [\"Manages physics simulation loop\", \"Checks collision between two bodies\"]\n\n"
+                + "\n---\n".join(entries)
+            )
+
+            raw = await self.generate(prompt, system="Return valid JSON array only. No markdown.")
+            if not raw:
+                continue
+
+            # Парсим JSON-массив из ответа
+            try:
+                # Убираем markdown code block если LLM обернул
+                clean = raw.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1]
+                    clean = clean.rsplit("```", 1)[0]
+                summaries = json.loads(clean)
+                if isinstance(summaries, list):
+                    for idx, node in enumerate(batch):
+                        if idx < len(summaries) and summaries[idx]:
+                            results[node.node_id] = str(summaries[idx])[:200]
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"Batch summary parse error: {e}, falling back")
+                # Fallback: пытаемся построчно
+                lines = [l.strip().strip('"').strip(',') for l in raw.strip().split('\n') if l.strip()]
+                for idx, node in enumerate(batch):
+                    if idx < len(lines):
+                        results[node.node_id] = lines[idx][:200]
+
+        return results
+
+
 # Singleton
 _llm_client: Optional[LLMClient] = None
 
