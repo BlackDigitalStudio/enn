@@ -11,7 +11,8 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
 from .api.routes import router, set_storage, set_vector_store
@@ -112,10 +113,19 @@ app.add_middleware(
 # Подключение роутеров
 app.include_router(router)
 
+# Статический фронтенд
+import pathlib
+_static_dir = pathlib.Path(__file__).parent / "static"
+if _static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(_static_dir)), name="static")
+
 
 @app.get("/")
 async def root():
-    """Корневой endpoint"""
+    """UI Dashboard"""
+    index = _static_dir / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
     return {
         "name": "Agentic GraphRAG",
         "version": "0.1.0",
