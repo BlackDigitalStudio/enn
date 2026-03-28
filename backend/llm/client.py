@@ -1,5 +1,5 @@
 """
-Agentic GraphRAG - LLM Client
+Tree Base - LLM Client
 Провайдер-агностичный клиент для работы с LLM.
 
 Поддерживаемые провайдеры:

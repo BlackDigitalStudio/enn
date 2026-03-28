@@ -1,9 +1,9 @@
 """
 Tree Base - Universal Knowledge Graph
 Graph navigation + entity extraction for any content type.
+No embeddings, no vector search — pure graph intelligence.
 """
 
-import os
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -12,9 +12,8 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import get_settings
-from .api.routes import router, set_storage, set_vector_store
+from .api.routes import router, set_storage
 from .graph.storage import Neo4jStorage
-from .llm.embeddings import VectorStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,19 +22,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-
     neo4j = Neo4jStorage(uri=settings.neo4j_uri, user=settings.neo4j_user, password=settings.neo4j_password)
     if neo4j.connect():
         logger.info("Neo4j connected")
         set_storage(neo4j)
     else:
         logger.warning("Neo4j connection failed")
-
-    vector_store = VectorStore(url=settings.qdrant_url, collection=settings.qdrant_collection)
-    if vector_store.connect():
-        logger.info("Qdrant connected (optional)")
-        set_vector_store(vector_store)
-
     yield
     neo4j.close()
 

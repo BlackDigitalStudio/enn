@@ -243,7 +243,11 @@ async def _extract_chunk_with_context(
                 continue
             data = _parse_json_response(response)
             if data:
-                return data
+                # Handle both {"entities":...} and [{"entities":...}] formats
+                if isinstance(data, list) and len(data) > 0:
+                    data = data[0]
+                if isinstance(data, dict):
+                    return data
             logger.warning(f"Unparseable response for {chunk_id} (attempt {attempt+1}): {response[:100]}")
         except Exception as e:
             logger.warning(f"Extraction error for {chunk_id} (attempt {attempt+1}): {e}")

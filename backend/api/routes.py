@@ -15,7 +15,6 @@ import json
 from ..graph.models import GraphNode, GraphEdge, IngestResult
 from ..graph.storage import Neo4jStorage
 from ..parser.txt_converter import scan_and_filter
-from ..llm.embeddings import VectorStore, get_embeddings_batch
 from ..llm.entity_extractor import extract_all_files, merge_file_states
 
 logger = logging.getLogger(__name__)
@@ -23,7 +22,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["graph"])
 
 _storage: Optional[Neo4jStorage] = None
-_vector_store: Optional[VectorStore] = None
 
 
 def set_storage(s: Neo4jStorage):
@@ -35,17 +33,6 @@ def get_storage() -> Neo4jStorage:
     if _storage is None or _storage._driver is None:
         raise HTTPException(status_code=503, detail="Neo4j not connected")
     return _storage
-
-
-def set_vector_store(vs: VectorStore):
-    global _vector_store
-    _vector_store = vs
-
-
-def get_vector_store() -> VectorStore:
-    if _vector_store is None:
-        raise HTTPException(status_code=503, detail="Qdrant not connected")
-    return _vector_store
 
 
 # ============== Models ==============
@@ -115,8 +102,6 @@ async def get_stats():
 async def clear_graph():
     s = get_storage()
     s.clear_all()
-    if _vector_store:
-        _vector_store.delete_all()
     return {"message": "Graph cleared"}
 
 
@@ -225,7 +210,7 @@ async def upload_project(file: UploadFile = File(...)):
 @router.post("/pipeline")
 async def auto_pipeline(request: PipelineRequest):
     """
-    Tree Base pipeline: scan → chunks → entity extraction → embeddings (optional).
+    Tree Base pipeline: scan → chunks → entity extraction. No embeddings needed.
     """
     from ..llm.client import get_llm_client
     import time as _time
@@ -349,26 +334,6 @@ async def auto_pipeline(request: PipelineRequest):
     steps.append({"step": "extraction", "time_s": round(_time.time() - step_start, 2),
                    "entities": len(entity_nodes), "edges": len(entity_edges)})
     logger.info(f"Step 3 (extraction): {len(entity_nodes)} entities, {len(entity_edges)} edges")
-
-    # STEP 4: Embeddings (optional)
-    step_start = _time.time()
-    emb_count = 0
-    all_nodes = doc_nodes + entity_nodes
-    try:
-        vs = get_vector_store()
-        if vs and all_nodes:
-            texts = [n.source_code if n.type == "document" and n.source_code
-                     else f"{n.type}: {n.name} - {n.summary}" for n in all_nodes]
-            embeddings = await get_embeddings_batch(texts)
-            items = [{"node_id": n.node_id, "embedding": e,
-                       "payload": {"type": n.type, "name": n.name, "summary": n.summary, "file_path": n.file_path}}
-                     for n, e in zip(all_nodes, embeddings) if e]
-            emb_count = vs.upsert_batch(items)
-    except Exception as e:
-        logger.warning(f"Embeddings skipped: {e}")
-
-    steps.append({"step": "embeddings", "time_s": round(_time.time() - step_start, 2),
-                   "indexed": emb_count, "optional": True})
 
     total_time = round(_time.time() - pipeline_start, 2)
     return {

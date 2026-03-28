@@ -1,5 +1,4 @@
-# Agentic GraphRAG - Configuration
-# Все настройки через environment variables
+# Tree Base - Configuration
 
 from pydantic_settings import BaseSettings
 from functools import lru_cache
@@ -12,11 +11,7 @@ class Settings(BaseSettings):
     neo4j_user: str = "neo4j"
     neo4j_password: str = "password"
 
-    # Qdrant Configuration
-    qdrant_url: str = "http://localhost:6333"
-    qdrant_collection: str = "graphrag_nodes"
-
-    # LLM Configuration (провайдер-агностик)
+    # LLM Configuration
     # Поддерживаемые провайдеры: "gemini", "openai", "anthropic"
     llm_provider: str = "openai"
     llm_api_key: str = ""
@@ -24,12 +19,11 @@ class Settings(BaseSettings):
     llm_base_url: Optional[str] = "https://api.deepseek.com/v1/chat/completions"
 
     # Application Settings
-    app_name: str = "Agentic GraphRAG"
+    app_name: str = "Tree Base"
     debug: bool = True
 
     # Graph Settings
     max_subgraph_depth: int = 3
-    default_embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
     class Config:
         env_file = ".env"
