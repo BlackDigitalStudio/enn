@@ -594,7 +594,8 @@ async def auto_pipeline(request: PipelineRequest):
 
     if all_nodes:
         texts = [
-            f"{n.type}: {n.name} - {n.summary}"
+            (n.source_code or "")[:500] if n.type == "document" and n.source_code
+            else f"{n.type}: {n.name} - {n.summary}"
             for n in all_nodes
         ]
         embeddings = await get_embeddings_batch(texts)
@@ -720,15 +721,16 @@ async def index_embeddings():
         if not nodes_chunk:
             break
 
-        # Формируем текст для эмбеддинга
+        # Формируем текст для эмбеддинга — документы по содержимому, остальное по метаданным
         texts = []
         for node in nodes_chunk:
-            text = f"{node.type}: {node.name}"
-            if node.summary:
-                text += f" - {node.summary}"
-            if node.signature:
-                text += f" ({node.signature})"
-            texts.append(text)
+            if node.type == "document" and node.source_code:
+                texts.append(node.source_code[:500])
+            else:
+                text = f"{node.type}: {node.name}"
+                if node.summary:
+                    text += f" - {node.summary}"
+                texts.append(text)
 
         # Батч-генерация эмбеддингов через Gemini
         embeddings = await get_embeddings_batch(texts)
