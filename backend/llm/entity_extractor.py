@@ -35,8 +35,8 @@ Extract ALL meaningful entities. Return ONLY valid JSON (no markdown, no comment
   "entities": [
     {{
       "name": "unique canonical name (lowercase, no duplicates)",
-      "type": "entity|topic|fact|skill|preference",
-      "summary": "one-line description",
+      "type": "choose the most specific type (e.g. person, character, location, item, ability, ingredient, library, class, function, concept, event, organization, technology, recipe, emotion, relationship...)",
+      "summary": "one-line description in the same language as the content",
       "confidence": 0.0-1.0
     }}
   ],
@@ -44,24 +44,20 @@ Extract ALL meaningful entities. Return ONLY valid JSON (no markdown, no comment
     {{
       "source": "source entity name",
       "target": "target entity name",
-      "type": "MENTIONS|REVEALS|BELONGS_TO|SKILLED_IN|DESCRIBES|CONTRADICTS|RELATES_TO",
+      "type": "choose the most descriptive relationship (e.g. KNOWS, USES, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES, DEPENDS_ON, TEACHES, CONTRADICTS, EVOLVES_INTO...)",
       "weight": 0.0-1.0
     }}
   ]
 }}
 
 RULES:
-- "entity" = named thing (person, library, class, product, place)
-- "topic" = thematic cluster (programming, cooking, finance, health)
-- "fact" = specific verifiable claim ("uses CMake 3.31", "Bitcoin ATH = $108K")
-- "skill" = competency ("C++ templates", "React hooks")
-- "preference" = user preference ("prefers dark mode", "likes minimal UI")
-- Confidence < 0.3 = skip it
-- Entity names must be canonical (lowercase, singular, no file paths)
-- For code: extract class names, libraries, patterns — NOT every function call
-- For text: extract key concepts, people, claims — NOT filler words
-- Maximum 20 entities per chunk (focus on most important)
-- Maximum 30 edges per chunk
+- Use the most specific type possible — "character" not "entity", "ingredient" not "thing"
+- Entity names must be canonical (lowercase, singular)
+- Summary should be in the same language as the source content
+- Confidence < 0.3 = skip
+- For code: class names, libraries, patterns — NOT every variable
+- For text: people, places, events, claims, relationships — NOT filler words
+- Maximum 20 entities + 30 edges per chunk (focus on most important)
 """
 
 # Батч-промпт для обработки нескольких узлов за раз
@@ -76,20 +72,20 @@ Return ONLY valid JSON array (no markdown):
   {{
     "source_id": "item ID from above",
     "entities": [
-      {{"name": "...", "type": "entity|topic|fact|skill|preference", "summary": "...", "confidence": 0.0-1.0}}
+      {{"name": "canonical name (lowercase)", "type": "most specific type (person, location, item, ability, library, class, concept, event, ingredient, technology...)", "summary": "one-line description in the same language as content", "confidence": 0.0-1.0}}
     ],
     "edges": [
-      {{"source": "...", "target": "...", "type": "MENTIONS|REVEALS|BELONGS_TO|SKILLED_IN|DESCRIBES|RELATES_TO", "weight": 0.0-1.0}}
+      {{"source": "entity name", "target": "entity name", "type": "descriptive relationship (KNOWS, USES, LOCATED_IN, PART_OF, CREATES, DEPENDS_ON, CONTRADICTS...)", "weight": 0.0-1.0}}
     ]
   }}
 ]
 
 RULES:
 - Max 10 entities + 15 edges per item
+- Use specific types — "character" not "entity", "ingredient" not "thing"
 - Entity names: lowercase, canonical, deduplicated across items
+- Summaries in the same language as source content
 - Skip confidence < 0.3
-- For code: class names, libraries, patterns — not every variable
-- For docs: key concepts, claims, references — not filler
 """
 
 
@@ -298,37 +294,41 @@ async def extract_entities_batch(
 
 def resolve_entities(
     entities: List[ExtractedEntity],
-    similarity_threshold: float = 0.9,
+    similarity_threshold: float = 0.85,
 ) -> Dict[str, str]:
     """
     Entity resolution — дедупликация сущностей.
 
-    Простая стратегия (без эмбеддингов):
-    - Точное совпадение имени → merge
-    - Имя является подстрокой другого → merge к более длинному
-    - Совпадение с нормализацией (пробелы, дефисы, подчёркивания) → merge
+    Двухфазная стратегия:
+    1. Строковая: нормализация, точное совпадение, подстроки (быстро)
+    2. Семантическая: cosine similarity эмбеддингов имён (для кросс-язычных матчей)
+
+    "кулинария" ↔ "cooking" → merge (семантически одно и то же)
+    "react" ↔ "react hooks" → НЕ merge (подстрока, но разные типы)
 
     Returns: {original_name: canonical_name}
     """
     name_map: Dict[str, str] = {}
     canonical: Dict[str, ExtractedEntity] = {}
 
+    # Phase 1: String-based resolution
     for ent in entities:
         normalized = _normalize_name(ent.name)
 
-        # Точное совпадение после нормализации
         if normalized in canonical:
             name_map[ent.name] = canonical[normalized].name
-            # Обновляем confidence если выше
             if ent.confidence > canonical[normalized].confidence:
                 canonical[normalized] = ent
             continue
 
-        # Проверяем подстроки
+        # Substring match — only if names are very close (avoids "react" ↔ "reactivity")
         merged = False
         for existing_norm, existing_ent in list(canonical.items()):
-            if normalized in existing_norm or existing_norm in normalized:
-                # Берём более длинное имя как каноническое
+            if normalized == existing_norm:
+                continue  # Already handled above
+            # Only substring-merge if one is ≥80% of the other (close names)
+            shorter, longer = sorted([normalized, existing_norm], key=len)
+            if shorter in longer and len(shorter) / len(longer) >= 0.8:
                 if len(normalized) >= len(existing_norm):
                     canonical[normalized] = ent
                     name_map[existing_ent.name] = ent.name
@@ -341,6 +341,31 @@ def resolve_entities(
         if not merged:
             canonical[normalized] = ent
             name_map[ent.name] = ent.name
+
+    # Phase 2: Semantic resolution via embeddings
+    # Merge entities with different names but same meaning (cross-language)
+    try:
+        from ..llm.embeddings import _get_model
+        model = _get_model()
+
+        canon_list = list(canonical.items())
+        if len(canon_list) > 1:
+            # Compare "name: summary" pairs, not just names
+            # This prevents merging "python (language)" with "python (snake)"
+            texts = [f"{ent.name}: {ent.summary}" for _, ent in canon_list]
+            embeddings = model.encode(texts, normalize_embeddings=True)
+
+            for i in range(len(canon_list)):
+                for j in range(i + 1, len(canon_list)):
+                    sim = float(embeddings[i] @ embeddings[j])
+                    if sim >= similarity_threshold:
+                        # Merge j into i (i is canonical)
+                        name_j = canon_list[j][1].name
+                        name_i = canon_list[i][1].name
+                        name_map[name_j] = name_i
+                        logger.info(f"Semantic merge: '{name_j}' → '{name_i}' (sim={sim:.3f})")
+    except Exception as e:
+        logger.warning(f"Semantic entity resolution skipped: {e}")
 
     return name_map
 

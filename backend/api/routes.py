@@ -387,6 +387,46 @@ async def upload_project(file: UploadFile = File(...)):
     }
 
 
+def _split_into_chunks(text: str, max_size: int = 2000) -> List[str]:
+    """Split text into chunks ≤ max_size, breaking on paragraph boundaries."""
+    if len(text) <= max_size:
+        return [text]
+
+    chunks = []
+    paragraphs = text.split('\n\n')
+    current = ""
+
+    for para in paragraphs:
+        # If single paragraph exceeds max_size, split by newlines then by chars
+        if len(para) > max_size:
+            if current:
+                chunks.append(current)
+                current = ""
+            lines = para.split('\n')
+            for line in lines:
+                if len(current) + len(line) + 1 > max_size:
+                    if current:
+                        chunks.append(current)
+                    # If single line exceeds max_size, hard split
+                    while len(line) > max_size:
+                        chunks.append(line[:max_size])
+                        line = line[max_size:]
+                    current = line
+                else:
+                    current = current + '\n' + line if current else line
+        elif len(current) + len(para) + 2 > max_size:
+            if current:
+                chunks.append(current)
+            current = para
+        else:
+            current = current + '\n\n' + para if current else para
+
+    if current.strip():
+        chunks.append(current)
+
+    return chunks if chunks else [text[:max_size]]
+
+
 class PipelineRequest(BaseModel):
     directory: Optional[str] = None
     project_name: Optional[str] = None
@@ -435,10 +475,13 @@ async def auto_pipeline(request: PipelineRequest):
     logger.info(f"Step 1 (scan): {len(all_files)} files found")
 
     # ================================================================
-    # STEP 2: Create document nodes — each file = one node with content
+    # STEP 2: Create document chunks — each file split into ≤2000 char chunks
+    # Full content preserved, no truncation.
     # ================================================================
     step_start = _time.time()
     doc_nodes = []
+    chunk_edges = []
+    CHUNK_SIZE = 2000
 
     for fp in all_files:
         try:
@@ -447,38 +490,53 @@ async def auto_pipeline(request: PipelineRequest):
             if len(content.strip()) < 10:
                 continue
 
-            # Stable node_id from file path
             rel_path = os.path.relpath(fp, directory) if directory else fp
-            node_id = f"doc::{hashlib.sha256(rel_path.encode()).hexdigest()[:16]}"
-
-            _, ext = os.path.splitext(fp)
+            file_hash = hashlib.sha256(rel_path.encode()).hexdigest()[:16]
             name = os.path.basename(fp)
 
-            doc_nodes.append(GraphNode(
-                node_id=node_id,
-                type="document",
-                name=name,
-                signature=rel_path,
-                file_path=rel_path,
-                line_start=0,
-                line_end=content.count('\n'),
-                source_code=content[:8000],  # Keep first 8K for entity extraction
-                summary=f"Document: {name} ({len(content)} chars)",
-                tags=[],
-            ))
+            # Split into chunks on paragraph boundaries
+            chunks = _split_into_chunks(content, CHUNK_SIZE)
+
+            prev_node_id = None
+            for ci, chunk_text in enumerate(chunks):
+                node_id = f"doc::{file_hash}::{ci}"
+                doc_nodes.append(GraphNode(
+                    node_id=node_id,
+                    type="document",
+                    name=f"{name}::chunk_{ci}",
+                    signature=rel_path,
+                    file_path=rel_path,
+                    line_start=0,
+                    line_end=0,
+                    source_code=chunk_text,
+                    summary=f"{name} [{ci+1}/{len(chunks)}]",
+                    tags=[],
+                ))
+                # NEXT_CHUNK edge for ordering
+                if prev_node_id:
+                    chunk_edges.append(GraphEdge(
+                        source_id=prev_node_id,
+                        target_id=node_id,
+                        edge_type="NEXT_CHUNK",
+                    ))
+                prev_node_id = node_id
         except Exception as e:
             errors.append(f"{fp}: {e}")
 
     if doc_nodes:
         s.bulk_create_nodes(doc_nodes)
+    if chunk_edges:
+        s.bulk_create_edges(chunk_edges)
 
     steps.append({
-        "step": "create_documents",
+        "step": "create_chunks",
         "time_s": round(_time.time() - step_start, 2),
-        "nodes_created": len(doc_nodes),
+        "files": len(all_files),
+        "chunks_created": len(doc_nodes),
+        "chunk_edges": len(chunk_edges),
         "errors": len(errors),
     })
-    logger.info(f"Step 2 (documents): {len(doc_nodes)} nodes created")
+    logger.info(f"Step 2 (chunks): {len(all_files)} files → {len(doc_nodes)} chunks")
 
     # ================================================================
     # STEP 3: Entity Extraction — THE CORE
@@ -505,8 +563,8 @@ async def auto_pipeline(request: PipelineRequest):
             })
 
         if extraction_items:
-            batch_size = 50
-            concurrency = 10
+            batch_size = 10
+            concurrency = 20
             logger.info(f"Step 3 (extraction): {len(extraction_items)} items, batch_size={batch_size}, concurrency={concurrency}")
 
             raw_entities, raw_edges = await extract_entities_batch(
@@ -594,7 +652,7 @@ async def auto_pipeline(request: PipelineRequest):
 
     if all_nodes:
         texts = [
-            (n.source_code or "")[:500] if n.type == "document" and n.source_code
+            n.source_code if n.type == "document" and n.source_code
             else f"{n.type}: {n.name} - {n.summary}"
             for n in all_nodes
         ]

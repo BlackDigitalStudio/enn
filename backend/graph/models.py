@@ -303,14 +303,6 @@ ALLOWED_TAGS = {tag.value for tag in TagEnum}
 def validate_tags(tags: List[str]) -> List[str]:
     """
     Валидация тегов.
-    Возвращает только разрешенные теги.
-    Неразмеченные концепции попадают в лог.
+    Принимает любые теги — система не ограничивает категории.
     """
-    valid_tags = [t for t in tags if t in ALLOWED_TAGS]
-    invalid_tags = [t for t in tags if t not in ALLOWED_TAGS]
-    
-    if invalid_tags:
-        import logging
-        logging.getLogger(__name__).debug(f"Unknown tags rejected: {invalid_tags}")
-    
-    return valid_tags
+    return [t.lower().strip() for t in tags if t and t.strip()]
