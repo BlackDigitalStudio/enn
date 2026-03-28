@@ -473,13 +473,13 @@ class Neo4jStorage:
         """Search entities by name (case-insensitive contains)."""
         cypher = """
         MATCH (n:Node)
-        WHERE n.type <> 'document' AND toLower(n.name) CONTAINS toLower($query)
+        WHERE n.type <> 'document' AND toLower(n.name) CONTAINS toLower($search_term)
         RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
         ORDER BY n.name
-        LIMIT $limit
+        LIMIT $lim
         """
         with self._driver.session(database=self.database) as session:
-            result = session.run(cypher, query=query, limit=limit)
+            result = session.run(cypher, search_term=query, lim=limit)
             return [dict(r) for r in result]
 
     # ============== Statistics ==============

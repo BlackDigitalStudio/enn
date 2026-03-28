@@ -282,20 +282,20 @@ async def extract_file_sequential(
         )
 
         if data:
-            state.update_from_extraction(
-                data.get("entities", []),
-                data.get("edges", []),
-                chunk_id,
-            )
-
-        # Small delay between chunks to avoid rate limits
-        await asyncio.sleep(0.5)
-
-        if (i + 1) % 10 == 0 or i == len(chunks) - 1:
+            new_ents = data.get("entities", [])
+            new_edges = data.get("edges", [])
+            state.update_from_extraction(new_ents, new_edges, chunk_id)
+            ent_names = [e.get("name", "?") for e in new_ents[:5]]
+            edge_types = [e.get("type", "?") for e in new_edges[:3]]
             logger.info(
-                f"  {file_name}: {i+1}/{len(chunks)} chunks, "
-                f"{len(state.entities)} entities, {len(state.edges)} edges"
+                f"  [{i+1}/{len(chunks)}] +{len(new_ents)} entities, +{len(new_edges)} edges | "
+                f"entities: {ent_names} | edges: {edge_types} | "
+                f"total: {len(state.entities)} entities, {len(state.edges)} edges"
             )
+        else:
+            logger.warning(f"  [{i+1}/{len(chunks)}] no data returned")
+
+        await asyncio.sleep(0.5)
 
     return state
 
