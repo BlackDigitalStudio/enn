@@ -1,402 +1,393 @@
 """
-Entity Extractor — извлечение сущностей, фактов и топиков из любого контента.
+Entity Extractor — context-aware extraction with write-access to the knowledge graph.
 
-Работает с любым типом данных:
-- Код (C++, Python) → технические сущности, зависимости
-- Документация (.md) → описания, архитектурные решения
-- Диалоги с нейросетью → факты о пользователе, предпочтения
-- Произвольный текст → топики, именованные сущности, ключевые факты
+Core principle: extraction is NOT "create entities from chunk".
+It IS "update the knowledge graph with new information from this chunk".
 
-Выход: список сущностей (ENTITY, FACT, TOPIC, SKILL, PREFERENCE)
-       + список рёбер между ними и исходным узлом
+Each chunk sees existing entities and can:
+- Reuse existing entity (same name, same type)
+- Update summary of existing entity with new information
+- Add new edges between existing entities
+- Update edge types when relationships evolve (enemies → friends)
+- Create new entities only when genuinely new
+
+Processing order:
+- Sequential within one file (chunks of a book go in order)
+- Parallel between files (16 books processed simultaneously)
 """
 
 import json
 import logging
+import asyncio
 from typing import List, Dict, Any, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# Промпт для LLM — универсальная экстракция
-EXTRACTION_PROMPT = """You are a knowledge graph entity extractor. Analyze the content below and extract structured entities.
+# Context-aware extraction prompt — sees existing entities
+CONTEXT_EXTRACTION_PROMPT = """You are a knowledge graph updater. Read the new content and update the knowledge graph.
 
-CONTENT TYPE: {content_type}
-SOURCE: {source_name}
+EXISTING ENTITIES IN GRAPH:
+{existing_entities}
 
-CONTENT:
+NEW CONTENT (from {source_name}):
 {content}
 
 ---
 
-Extract ALL meaningful entities. Return ONLY valid JSON (no markdown, no commentary):
+Return ONLY valid JSON (no markdown):
 
 {{
   "entities": [
     {{
-      "name": "unique canonical name (lowercase, no duplicates)",
-      "type": "choose the most specific type (e.g. person, character, location, item, ability, ingredient, library, class, function, concept, event, organization, technology, recipe, emotion, relationship...)",
-      "summary": "one-line description in the same language as the content",
+      "name": "canonical name (lowercase, reuse existing names when possible)",
+      "type": "most specific type (character, location, ability, ingredient, class, concept...)",
+      "summary": "updated description incorporating new info (same language as content)",
+      "action": "create|update",
       "confidence": 0.0-1.0
     }}
   ],
   "edges": [
     {{
-      "source": "source entity name",
-      "target": "target entity name",
-      "type": "choose the most descriptive relationship (e.g. KNOWS, USES, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES, DEPENDS_ON, TEACHES, CONTRADICTS, EVOLVES_INTO...)",
+      "source": "entity name",
+      "target": "entity name",
+      "type": "descriptive relationship (KNOWS, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES...)",
+      "weight": 0.0-1.0,
+      "action": "create|update"
+    }}
+  ]
+}}
+
+RULES:
+- REUSE existing entity names — do NOT create "меркурий" if "меркурий" already exists
+- REUSE existing types — if "меркурий" is already "character", keep it "character"
+- UPDATE summaries — if you learn something new about an existing entity, set action="update"
+- UPDATE edges — if a relationship changed (enemies became friends), set action="update" with new type
+- CREATE only genuinely new entities not in the existing list
+- Summaries in the same language as source content
+- Maximum 15 entities + 20 edges per chunk
+- Skip confidence < 0.3
+"""
+
+# First chunk prompt (no existing entities yet)
+INITIAL_EXTRACTION_PROMPT = """You are a knowledge graph builder. Extract entities and relationships from this content.
+
+CONTENT (from {source_name}):
+{content}
+
+---
+
+Return ONLY valid JSON (no markdown):
+
+{{
+  "entities": [
+    {{
+      "name": "canonical name (lowercase)",
+      "type": "most specific type (character, location, ability, ingredient, class, concept...)",
+      "summary": "one-line description (same language as content)",
+      "confidence": 0.0-1.0
+    }}
+  ],
+  "edges": [
+    {{
+      "source": "entity name",
+      "target": "entity name",
+      "type": "descriptive relationship (KNOWS, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES...)",
       "weight": 0.0-1.0
     }}
   ]
 }}
 
 RULES:
-- Use the most specific type possible — "character" not "entity", "ingredient" not "thing"
-- Entity names must be canonical (lowercase, singular)
-- Summary should be in the same language as the source content
-- Confidence < 0.3 = skip
-- For code: class names, libraries, patterns — NOT every variable
-- For text: people, places, events, claims, relationships — NOT filler words
-- Maximum 20 entities + 30 edges per chunk (focus on most important)
-"""
-
-# Батч-промпт для обработки нескольких узлов за раз
-BATCH_EXTRACTION_PROMPT = """You are a knowledge graph entity extractor. Process these {count} items and extract entities from each.
-
-{items_text}
-
----
-
-Return ONLY valid JSON array (no markdown):
-[
-  {{
-    "source_id": "item ID from above",
-    "entities": [
-      {{"name": "canonical name (lowercase)", "type": "most specific type (person, location, item, ability, library, class, concept, event, ingredient, technology...)", "summary": "one-line description in the same language as content", "confidence": 0.0-1.0}}
-    ],
-    "edges": [
-      {{"source": "entity name", "target": "entity name", "type": "descriptive relationship (KNOWS, USES, LOCATED_IN, PART_OF, CREATES, DEPENDS_ON, CONTRADICTS...)", "weight": 0.0-1.0}}
-    ]
-  }}
-]
-
-RULES:
-- Max 10 entities + 15 edges per item
-- Use specific types — "character" not "entity", "ingredient" not "thing"
-- Entity names: lowercase, canonical, deduplicated across items
+- Use most specific type: "character" not "entity", "ingredient" not "thing"
+- Entity names: lowercase, canonical
 - Summaries in the same language as source content
+- Maximum 15 entities + 20 edges
 - Skip confidence < 0.3
 """
 
 
 @dataclass
-class ExtractedEntity:
-    """Извлечённая сущность"""
+class EntityState:
+    """Живое состояние сущности в процессе extraction."""
     name: str
-    type: str  # entity, topic, fact, skill, preference
+    type: str
     summary: str
     confidence: float
-    source_node_id: str  # откуда извлечено
+    source_chunks: List[str] = field(default_factory=list)  # chunk IDs where mentioned
 
 
 @dataclass
-class ExtractedEdge:
-    """Извлечённое ребро"""
-    source_name: str
-    target_name: str
+class EdgeState:
+    """Живое состояние ребра."""
+    source: str
+    target: str
     edge_type: str
     weight: float
-    source_node_id: str  # контекст откуда извлечено
+    source_chunk: str = ""
 
 
-async def extract_entities_single(
-    llm_client,
-    content: str,
-    content_type: str,
-    source_name: str,
-    source_node_id: str,
-) -> Tuple[List[ExtractedEntity], List[ExtractedEdge]]:
+class KnowledgeGraphState:
     """
-    Извлекает сущности из одного куска контента.
+    In-memory state of the knowledge graph during extraction.
+    Updated after each chunk. Passed to LLM as context.
     """
-    if not content or len(content.strip()) < 20:
-        return [], []
 
-    # Обрезаем контент до 4000 символов (экономия токенов)
-    truncated = content[:4000]
+    def __init__(self):
+        self.entities: Dict[str, EntityState] = {}  # name → EntityState
+        self.edges: List[EdgeState] = []
 
-    prompt = EXTRACTION_PROMPT.format(
-        content_type=content_type,
-        source_name=source_name,
-        content=truncated,
-    )
+    def format_for_prompt(self, max_entities: int = 50) -> str:
+        """Format existing entities for inclusion in extraction prompt."""
+        if not self.entities:
+            return "(empty — this is the first chunk)"
 
-    try:
-        response = await llm_client.generate(prompt)
-        if not response:
-            return [], []
+        # Sort by confidence descending, take top N
+        sorted_ents = sorted(self.entities.values(), key=lambda e: -e.confidence)[:max_entities]
+        lines = []
+        for ent in sorted_ents:
+            lines.append(f"- {ent.name} [{ent.type}]: {ent.summary}")
+        return "\n".join(lines)
 
-        data = _parse_json_response(response)
-        if not data:
-            return [], []
-
-        entities = []
-        for e in data.get("entities", []):
-            conf = float(e.get("confidence", 0))
+    def update_from_extraction(self, entities: List[Dict], edges: List[Dict], chunk_id: str):
+        """Update state with extraction results from one chunk."""
+        for ent in entities:
+            name = ent["name"].lower().strip()
+            if not name:
+                continue
+            conf = float(ent.get("confidence", 0.5))
             if conf < 0.3:
                 continue
-            entities.append(ExtractedEntity(
-                name=e["name"].lower().strip(),
-                type=e.get("type", "entity"),
-                summary=e.get("summary", ""),
-                confidence=conf,
-                source_node_id=source_node_id,
-            ))
 
-        edges = []
-        for ed in data.get("edges", []):
+            if name in self.entities:
+                # Update existing
+                existing = self.entities[name]
+                if ent.get("summary"):
+                    existing.summary = ent["summary"]
+                if conf > existing.confidence:
+                    existing.confidence = conf
+                existing.source_chunks.append(chunk_id)
+            else:
+                # Create new
+                self.entities[name] = EntityState(
+                    name=name,
+                    type=ent.get("type", "entity"),
+                    summary=ent.get("summary", ""),
+                    confidence=conf,
+                    source_chunks=[chunk_id],
+                )
+
+        for ed in edges:
+            src = ed.get("source", "").lower().strip()
+            tgt = ed.get("target", "").lower().strip()
+            if not src or not tgt:
+                continue
             w = float(ed.get("weight", 0.5))
             if w < 0.2:
                 continue
-            edges.append(ExtractedEdge(
-                source_name=ed["source"].lower().strip(),
-                target_name=ed["target"].lower().strip(),
-                edge_type=ed.get("type", "RELATES_TO"),
-                weight=w,
-                source_node_id=source_node_id,
-            ))
 
-        return entities, edges
+            edge_type = ed.get("type", "RELATES_TO")
 
-    except Exception as e:
-        logger.error(f"Entity extraction failed for {source_name}: {e}")
-        return [], []
+            # Check if edge already exists — update type if action=update
+            updated = False
+            if ed.get("action") == "update":
+                for existing_edge in self.edges:
+                    if existing_edge.source == src and existing_edge.target == tgt:
+                        existing_edge.edge_type = edge_type
+                        existing_edge.weight = w
+                        existing_edge.source_chunk = chunk_id
+                        updated = True
+                        break
 
-
-async def _process_one_batch(
-    llm_client,
-    batch: List[Dict[str, Any]],
-    batch_idx: int,
-    total: int,
-) -> Tuple[List[ExtractedEntity], List[ExtractedEdge]]:
-    """Process a single batch of items through LLM. Called in parallel."""
-    entities = []
-    edges = []
-
-    items_text = ""
-    for idx, item in enumerate(batch):
-        content = (item.get("content") or "")[:2000]
-        items_text += f"\n--- ITEM {idx+1} (id: {item['node_id']}, type: {item['type']}) ---\n"
-        items_text += f"Name: {item['name']}\n"
-        items_text += f"Content:\n{content}\n"
-
-    prompt = BATCH_EXTRACTION_PROMPT.format(
-        count=len(batch),
-        items_text=items_text,
-    )
-
-    try:
-        response = await llm_client.generate(prompt)
-        if not response:
-            return entities, edges
-
-        results = _parse_json_response(response)
-        if not results:
-            return entities, edges
-
-        if isinstance(results, dict):
-            results = [results]
-
-        for result in results:
-            src_id = result.get("source_id", "")
-
-            for e in result.get("entities", []):
-                conf = float(e.get("confidence", 0))
-                if conf < 0.3:
-                    continue
-                entities.append(ExtractedEntity(
-                    name=e["name"].lower().strip(),
-                    type=e.get("type", "entity"),
-                    summary=e.get("summary", ""),
-                    confidence=conf,
-                    source_node_id=src_id,
+            if not updated:
+                self.edges.append(EdgeState(
+                    source=src, target=tgt,
+                    edge_type=edge_type, weight=w,
+                    source_chunk=chunk_id,
                 ))
 
-            for ed in result.get("edges", []):
-                w = float(ed.get("weight", 0.5))
-                if w < 0.2:
-                    continue
-                edges.append(ExtractedEdge(
-                    source_name=ed["source"].lower().strip(),
-                    target_name=ed["target"].lower().strip(),
-                    edge_type=ed.get("type", "RELATES_TO"),
-                    weight=w,
-                    source_node_id=src_id,
-                ))
 
-    except Exception as e:
-        logger.error(f"Batch extraction failed (batch {batch_idx}): {e}")
-
-    return entities, edges
-
-
-async def extract_entities_batch(
+async def _extract_chunk_with_context(
     llm_client,
-    items: List[Dict[str, Any]],
-    batch_size: int = 50,
-    concurrency: int = 10,
-) -> Tuple[List[ExtractedEntity], List[ExtractedEdge]]:
-    """
-    Батч-экстракция сущностей с параллельными вызовами.
+    content: str,
+    source_name: str,
+    chunk_id: str,
+    graph_state: KnowledgeGraphState,
+    max_retries: int = 2,
+) -> Optional[Dict]:
+    """Extract entities from one chunk, with context of existing graph state."""
 
-    - batch_size: сколько файлов в одном LLM-вызове (50 ≈ 30K input tokens)
-    - concurrency: сколько вызовов отправляем одновременно (10 параллельных)
+    existing = graph_state.format_for_prompt()
 
-    19K файлов: 384 батча → 39 раундов по 10 → ~30 мин вместо 53 часов.
-    """
-    import asyncio
+    if graph_state.entities:
+        prompt = CONTEXT_EXTRACTION_PROMPT.format(
+            existing_entities=existing,
+            source_name=source_name,
+            content=content,
+        )
+    else:
+        prompt = INITIAL_EXTRACTION_PROMPT.format(
+            source_name=source_name,
+            content=content,
+        )
 
-    all_entities = []
-    all_edges = []
-
-    # Split items into batches
-    batches = []
-    for i in range(0, len(items), batch_size):
-        batches.append(items[i:i + batch_size])
-
-    total_items = len(items)
-    processed = 0
-
-    # Process batches in parallel groups
-    for round_idx in range(0, len(batches), concurrency):
-        group = batches[round_idx:round_idx + concurrency]
-
-        tasks = [
-            _process_one_batch(llm_client, batch, round_idx + j, total_items)
-            for j, batch in enumerate(group)
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Parallel batch failed: {result}")
+    for attempt in range(max_retries + 1):
+        try:
+            response = await llm_client.generate(prompt)
+            if not response:
                 continue
-            ents, eds = result
-            all_entities.extend(ents)
-            all_edges.extend(eds)
+            data = _parse_json_response(response)
+            if data:
+                return data
+        except Exception as e:
+            logger.warning(f"Extraction attempt {attempt+1} failed for {chunk_id}: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(1)
 
-        processed += sum(len(b) for b in group)
-        logger.info(f"Entity extraction: {processed}/{total_items} items processed ({len(all_entities)} entities, {len(all_edges)} edges)")
-
-    return all_entities, all_edges
+    logger.error(f"Extraction failed after {max_retries+1} attempts: {chunk_id}")
+    return None
 
 
-def resolve_entities(
-    entities: List[ExtractedEntity],
-    similarity_threshold: float = 0.85,
-) -> Dict[str, str]:
+async def extract_file_sequential(
+    llm_client,
+    chunks: List[Dict[str, Any]],
+    file_name: str,
+) -> KnowledgeGraphState:
     """
-    Entity resolution — дедупликация сущностей.
-
-    Двухфазная стратегия:
-    1. Строковая: нормализация, точное совпадение, подстроки (быстро)
-    2. Семантическая: cosine similarity эмбеддингов имён (для кросс-язычных матчей)
-
-    "кулинария" ↔ "cooking" → merge (семантически одно и то же)
-    "react" ↔ "react hooks" → НЕ merge (подстрока, но разные типы)
-
-    Returns: {original_name: canonical_name}
+    Process all chunks of ONE file sequentially.
+    Each chunk sees entities extracted from previous chunks.
+    Returns the final graph state for this file.
     """
-    name_map: Dict[str, str] = {}
-    canonical: Dict[str, ExtractedEntity] = {}
+    state = KnowledgeGraphState()
 
-    # Phase 1: String-based resolution
-    for ent in entities:
-        normalized = _normalize_name(ent.name)
-
-        if normalized in canonical:
-            name_map[ent.name] = canonical[normalized].name
-            if ent.confidence > canonical[normalized].confidence:
-                canonical[normalized] = ent
+    for i, chunk in enumerate(chunks):
+        content = chunk.get("content", "")
+        if len(content.strip()) < 20:
             continue
 
-        # Substring match — only if names are very close (avoids "react" ↔ "reactivity")
-        merged = False
-        for existing_norm, existing_ent in list(canonical.items()):
-            if normalized == existing_norm:
-                continue  # Already handled above
-            # Only substring-merge if one is ≥80% of the other (close names)
-            shorter, longer = sorted([normalized, existing_norm], key=len)
-            if shorter in longer and len(shorter) / len(longer) >= 0.8:
-                if len(normalized) >= len(existing_norm):
-                    canonical[normalized] = ent
-                    name_map[existing_ent.name] = ent.name
-                    name_map[ent.name] = ent.name
-                else:
-                    name_map[ent.name] = existing_ent.name
-                merged = True
-                break
+        chunk_id = chunk["node_id"]
 
-        if not merged:
-            canonical[normalized] = ent
-            name_map[ent.name] = ent.name
+        data = await _extract_chunk_with_context(
+            llm_client, content, file_name, chunk_id, state
+        )
 
-    # Phase 2: Semantic resolution via embeddings
-    # Merge entities with different names but same meaning (cross-language)
-    try:
-        from ..llm.embeddings import _get_model
-        model = _get_model()
+        if data:
+            state.update_from_extraction(
+                data.get("entities", []),
+                data.get("edges", []),
+                chunk_id,
+            )
 
-        canon_list = list(canonical.items())
-        if len(canon_list) > 1:
-            # Compare "name: summary" pairs, not just names
-            # This prevents merging "python (language)" with "python (snake)"
-            texts = [f"{ent.name}: {ent.summary}" for _, ent in canon_list]
-            embeddings = model.encode(texts, normalize_embeddings=True)
+        if (i + 1) % 10 == 0 or i == len(chunks) - 1:
+            logger.info(
+                f"  {file_name}: {i+1}/{len(chunks)} chunks, "
+                f"{len(state.entities)} entities, {len(state.edges)} edges"
+            )
 
-            for i in range(len(canon_list)):
-                for j in range(i + 1, len(canon_list)):
-                    sim = float(embeddings[i] @ embeddings[j])
-                    if sim >= similarity_threshold:
-                        # Merge j into i (i is canonical)
-                        name_j = canon_list[j][1].name
-                        name_i = canon_list[i][1].name
-                        name_map[name_j] = name_i
-                        logger.info(f"Semantic merge: '{name_j}' → '{name_i}' (sim={sim:.3f})")
-    except Exception as e:
-        logger.warning(f"Semantic entity resolution skipped: {e}")
-
-    return name_map
+    return state
 
 
-def _normalize_name(name: str) -> str:
-    """Нормализация имени для дедупликации"""
-    return name.lower().strip().replace("-", "_").replace(" ", "_").replace("::", "_")
+async def extract_all_files(
+    llm_client,
+    files_chunks: Dict[str, List[Dict[str, Any]]],
+    concurrency: int = 10,
+) -> Dict[str, KnowledgeGraphState]:
+    """
+    Process multiple files in parallel.
+    Each file is processed sequentially (chunks in order).
+    Different files run in parallel (no dependency between them).
+
+    Args:
+        files_chunks: {file_path: [{"node_id": ..., "content": ...}, ...]}
+        concurrency: max parallel files
+
+    Returns:
+        {file_path: KnowledgeGraphState}
+    """
+    results: Dict[str, KnowledgeGraphState] = {}
+    file_list = list(files_chunks.items())
+
+    logger.info(f"Entity extraction: {len(file_list)} files, concurrency={concurrency}")
+
+    for batch_start in range(0, len(file_list), concurrency):
+        batch = file_list[batch_start:batch_start + concurrency]
+
+        tasks = [
+            extract_file_sequential(llm_client, chunks, file_name)
+            for file_name, chunks in batch
+        ]
+
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for (file_name, _), result in zip(batch, batch_results):
+            if isinstance(result, Exception):
+                logger.error(f"File extraction failed: {file_name}: {result}")
+                continue
+            results[file_name] = result
+
+        processed = min(batch_start + len(batch), len(file_list))
+        total_entities = sum(len(s.entities) for s in results.values())
+        total_edges = sum(len(s.edges) for s in results.values())
+        logger.info(
+            f"Entity extraction: {processed}/{len(file_list)} files done, "
+            f"{total_entities} entities, {total_edges} edges"
+        )
+
+    return results
+
+
+def merge_file_states(
+    file_states: Dict[str, KnowledgeGraphState],
+) -> KnowledgeGraphState:
+    """
+    Merge entity states from multiple files into one global state.
+    Entities with the same name are merged (summaries combined, confidence maxed).
+    """
+    global_state = KnowledgeGraphState()
+
+    for file_name, state in file_states.items():
+        for name, ent in state.entities.items():
+            if name in global_state.entities:
+                existing = global_state.entities[name]
+                # Keep higher confidence
+                if ent.confidence > existing.confidence:
+                    existing.confidence = ent.confidence
+                # Append summary if different
+                if ent.summary and ent.summary != existing.summary:
+                    existing.summary = ent.summary  # Latest wins
+                existing.source_chunks.extend(ent.source_chunks)
+            else:
+                global_state.entities[name] = EntityState(
+                    name=ent.name,
+                    type=ent.type,
+                    summary=ent.summary,
+                    confidence=ent.confidence,
+                    source_chunks=list(ent.source_chunks),
+                )
+
+        global_state.edges.extend(state.edges)
+
+    return global_state
 
 
 def _parse_json_response(text: str) -> Any:
-    """Парсим JSON из ответа LLM (может содержать markdown-обёртку)"""
+    """Parse JSON from LLM response (may contain markdown wrapper)."""
     text = text.strip()
 
-    # Убираем markdown code blocks
     if text.startswith("```"):
         lines = text.split("\n")
         lines = [l for l in lines if not l.startswith("```")]
         text = "\n".join(lines)
 
-    # Пробуем парсить как есть
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Ищем первый { или [
     for start_char, end_char in [("{", "}"), ("[", "]")]:
         start = text.find(start_char)
         if start == -1:
             continue
-        # Ищем соответствующую закрывающую скобку
         depth = 0
         for idx in range(start, len(text)):
             if text[idx] == start_char:
@@ -409,5 +400,5 @@ def _parse_json_response(text: str) -> Any:
                     except json.JSONDecodeError:
                         break
 
-    logger.warning(f"Failed to parse JSON from LLM response: {text[:200]}")
+    logger.warning(f"Failed to parse JSON: {text[:200]}")
     return None

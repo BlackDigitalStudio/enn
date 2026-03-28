@@ -19,7 +19,7 @@ from ..graph.models import GraphNode, GraphEdge, SubgraphResult, IngestResult, V
 from ..graph.storage import Neo4jStorage
 from ..parser.txt_converter import scan_and_filter
 from ..llm.embeddings import VectorStore, get_embedding, get_embeddings_batch
-from ..llm.entity_extractor import extract_entities_batch, resolve_entities
+from ..llm.entity_extractor import extract_all_files, merge_file_states, KnowledgeGraphState
 
 logger = logging.getLogger(__name__)
 
@@ -540,106 +540,94 @@ async def auto_pipeline(request: PipelineRequest):
 
     # ================================================================
     # STEP 3: Entity Extraction — THE CORE
-    # DeepSeek reads each document → extracts entities + edges
+    # Context-aware: sequential within file, parallel between files.
+    # Each chunk sees entities from previous chunks of the SAME file.
+    # LLM reuses existing entities, updates summaries, evolves edges.
     # ================================================================
     step_start = _time.time()
     entity_nodes = []
     entity_edges = []
-    extraction_api_calls = 0
-    extraction_tokens = {"input": 0, "output": 0}
 
     if client.api_key and doc_nodes:
-        # Prepare items for batch extraction
-        extraction_items = []
+        # Group chunks by file (for sequential processing within each file)
+        files_chunks: Dict[str, List[Dict[str, Any]]] = {}
         for node in doc_nodes:
             content = node.source_code or ""
             if len(content.strip()) < 20:
                 continue
-            extraction_items.append({
+            file_path = node.file_path or "unknown"
+            if file_path not in files_chunks:
+                files_chunks[file_path] = []
+            files_chunks[file_path].append({
                 "node_id": node.node_id,
-                "name": node.name,
-                "type": node.type,
                 "content": content,
             })
 
-        if extraction_items:
-            batch_size = 10
-            concurrency = 20
-            logger.info(f"Step 3 (extraction): {len(extraction_items)} items, batch_size={batch_size}, concurrency={concurrency}")
+        logger.info(f"Step 3 (extraction): {sum(len(c) for c in files_chunks.values())} chunks across {len(files_chunks)} files")
 
-            raw_entities, raw_edges = await extract_entities_batch(
-                client, extraction_items, batch_size=batch_size, concurrency=concurrency
-            )
-            extraction_api_calls = math.ceil(len(extraction_items) / batch_size)
-            logger.info(
-                f"Extraction done: {len(raw_entities)} entities, {len(raw_edges)} edges"
-            )
+        # Run extraction: sequential per file, parallel between files
+        file_states = await extract_all_files(
+            client, files_chunks, concurrency=10
+        )
 
-            # Entity resolution — deduplicate by normalized name
-            name_map = resolve_entities(raw_entities)
+        # Merge all file states into one global state
+        global_state = merge_file_states(file_states)
+        logger.info(f"Extraction done: {len(global_state.entities)} entities, {len(global_state.edges)} edges")
 
-            # Convert ExtractedEntity → GraphNode
-            seen_entity_ids = set()
-            for ent in raw_entities:
-                canonical = name_map.get(ent.name, ent.name)
-                ent_node_id = f"{ent.type}::{canonical}"
+        # Convert EntityState → GraphNode (node_id by name, not type)
+        for name, ent in global_state.entities.items():
+            node_id = f"entity::{name}"
+            entity_nodes.append(GraphNode(
+                node_id=node_id,
+                type=ent.type,
+                name=name,
+                signature="",
+                file_path="",
+                line_start=0,
+                line_end=0,
+                source_code="",
+                summary=ent.summary,
+                tags=[],
+            ))
 
-                if ent_node_id in seen_entity_ids:
-                    continue
-                seen_entity_ids.add(ent_node_id)
+        if entity_nodes:
+            s.bulk_create_nodes(entity_nodes)
 
-                entity_nodes.append(GraphNode(
-                    node_id=ent_node_id,
-                    type=ent.type,
-                    name=canonical,
-                    signature="",
-                    file_path="",
-                    line_start=0,
-                    line_end=0,
-                    source_code="",
-                    summary=ent.summary,
-                    tags=[],
+        # Create edges: document chunks → entities (MENTIONS)
+        entity_node_ids = {n.name: n.node_id for n in entity_nodes}
+        for name, ent in global_state.entities.items():
+            ent_node_id = entity_node_ids.get(name)
+            if not ent_node_id:
+                continue
+            for chunk_id in ent.source_chunks:
+                entity_edges.append(GraphEdge(
+                    source_id=chunk_id,
+                    target_id=ent_node_id,
+                    edge_type="MENTIONS",
+                    metadata={"confidence": ent.confidence},
                 ))
 
-            if entity_nodes:
-                s.bulk_create_nodes(entity_nodes)
+        # Create edges: entity → entity (semantic relationships)
+        for ed in global_state.edges:
+            src_id = entity_node_ids.get(ed.source)
+            tgt_id = entity_node_ids.get(ed.target)
+            if src_id and tgt_id:
+                entity_edges.append(GraphEdge(
+                    source_id=src_id,
+                    target_id=tgt_id,
+                    edge_type=ed.edge_type,
+                    metadata={"weight": ed.weight},
+                ))
 
-            # Create edges: document → entity (MENTIONS)
-            for ent in raw_entities:
-                canonical = name_map.get(ent.name, ent.name)
-                ent_node_id = f"{ent.type}::{canonical}"
-                if ent.source_node_id:
-                    entity_edges.append(GraphEdge(
-                        source_id=ent.source_node_id,
-                        target_id=ent_node_id,
-                        edge_type="MENTIONS",
-                        metadata={"confidence": ent.confidence},
-                    ))
-
-            # Create edges: entity → entity (semantic)
-            entity_by_name = {n.name: n.node_id for n in entity_nodes}
-            for ed in raw_edges:
-                src_canonical = name_map.get(ed.source_name, ed.source_name)
-                tgt_canonical = name_map.get(ed.target_name, ed.target_name)
-                src_id = entity_by_name.get(src_canonical)
-                tgt_id = entity_by_name.get(tgt_canonical)
-                if src_id and tgt_id:
-                    entity_edges.append(GraphEdge(
-                        source_id=src_id,
-                        target_id=tgt_id,
-                        edge_type=ed.edge_type,
-                        metadata={"weight": ed.weight},
-                    ))
-
-            if entity_edges:
-                s.bulk_create_edges(entity_edges)
+        if entity_edges:
+            s.bulk_create_edges(entity_edges)
 
     steps.append({
         "step": "entity_extraction",
         "time_s": round(_time.time() - step_start, 2),
         "entity_nodes": len(entity_nodes),
         "entity_edges": len(entity_edges),
-        "api_calls": extraction_api_calls,
+        "files_processed": len(files_chunks) if client.api_key and doc_nodes else 0,
     })
     logger.info(f"Step 3 (extraction): {len(entity_nodes)} entities, {len(entity_edges)} edges")
 
@@ -1133,124 +1121,5 @@ Based on this context, provide a detailed answer to the question."""
 
 @router.post("/extract/entities")
 async def extract_entities_from_graph():
-    """
-    Извлекает сущности (ENTITY, FACT, TOPIC, SKILL) из всех узлов графа.
-    Создаёт новые узлы-сущности и семантические рёбра.
-    Обрабатывает порциями по 10 узлов за один LLM-вызов.
-    """
-    import hashlib
-    import math
-
-    s = get_storage()
-    from ..llm.client import get_llm_client
-    client = get_llm_client()
-
-    if not client.api_key:
-        raise HTTPException(status_code=503, detail="LLM API key not configured")
-
-    # Забираем все узлы порциями
-    total_in_graph = s.count_nodes()
-    if total_in_graph == 0:
-        return {"message": "No nodes in graph"}
-
-    all_items = []
-    offset = 0
-    chunk_size = 500
-
-    while offset < total_in_graph:
-        nodes = s.search_nodes(limit=chunk_size, skip=offset)
-        if not nodes:
-            break
-        for node in nodes:
-            content = node.source_code or node.summary or node.name
-            if len(content.strip()) < 20:
-                continue
-            all_items.append({
-                "node_id": node.node_id,
-                "name": node.name,
-                "type": node.type,
-                "content": content,
-            })
-        offset += len(nodes)
-
-    logger.info(f"Entity extraction: {len(all_items)} nodes to process")
-
-    # Батч-экстракция
-    entities, edges = await extract_entities_batch(client, all_items, batch_size=10)
-    logger.info(f"Extracted: {len(entities)} entities, {len(edges)} edges")
-
-    # Entity resolution (дедупликация)
-    name_map = resolve_entities(entities)
-
-    # Создаём узлы-сущности в Neo4j
-    entity_nodes = {}  # canonical_name → GraphNode
-    for ent in entities:
-        canonical = name_map.get(ent.name, ent.name)
-        if canonical in entity_nodes:
-            continue  # Уже создан
-
-        node_id = f"{ent.type}::{canonical}"
-        entity_nodes[canonical] = GraphNode(
-            node_id=node_id,
-            type=ent.type,
-            name=canonical,
-            signature="",
-            file_path="",
-            line_start=0,
-            line_end=0,
-            source_code="",
-            summary=ent.summary,
-            tags=[],
-        )
-
-    # Bulk insert entity nodes
-    new_nodes = list(entity_nodes.values())
-    if new_nodes:
-        created = s.bulk_create_nodes(new_nodes)
-        logger.info(f"Created {created} entity nodes")
-
-    # Создаём семантические рёбра
-    # 1) source_node → entity (MENTIONS)
-    semantic_edges = []
-    for ent in entities:
-        canonical = name_map.get(ent.name, ent.name)
-        if canonical not in entity_nodes:
-            continue
-        entity_node = entity_nodes[canonical]
-
-        semantic_edges.append(GraphEdge(
-            source_id=ent.source_node_id,
-            target_id=entity_node.node_id,
-            edge_type="MENTIONS",
-            metadata={"confidence": ent.confidence, "weight": ent.confidence},
-        ))
-
-    # 2) entity → entity edges from extractor
-    for ed in edges:
-        src_canonical = name_map.get(ed.source_name, ed.source_name)
-        tgt_canonical = name_map.get(ed.target_name, ed.target_name)
-        if src_canonical not in entity_nodes or tgt_canonical not in entity_nodes:
-            continue
-
-        semantic_edges.append(GraphEdge(
-            source_id=entity_nodes[src_canonical].node_id,
-            target_id=entity_nodes[tgt_canonical].node_id,
-            edge_type=ed.edge_type,
-            metadata={"weight": ed.weight},
-        ))
-
-    # Bulk insert edges
-    if semantic_edges:
-        edge_count = s.bulk_create_edges(semantic_edges)
-        logger.info(f"Created {edge_count} semantic edges")
-
-    api_calls = math.ceil(len(all_items) / 10)
-
-    return {
-        "total_source_nodes": len(all_items),
-        "entities_extracted": len(entities),
-        "unique_entities": len(entity_nodes),
-        "semantic_edges": len(semantic_edges),
-        "entity_resolution_merges": sum(1 for k, v in name_map.items() if k != v),
-        "api_calls": api_calls,
-    }
+    """Legacy — use /pipeline instead. Entity extraction is now integrated into the pipeline."""
+    return {"message": "Entity extraction is now part of /pipeline. Use POST /api/v1/pipeline instead."}
