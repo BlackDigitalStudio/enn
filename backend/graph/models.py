@@ -310,7 +310,7 @@ def validate_tags(tags: List[str]) -> List[str]:
     invalid_tags = [t for t in tags if t not in ALLOWED_TAGS]
     
     if invalid_tags:
-        # Логирование неразмеченных концепций
-        print(f"[WARN] Unknown tags rejected: {invalid_tags}")
+        import logging
+        logging.getLogger(__name__).debug(f"Unknown tags rejected: {invalid_tags}")
     
     return valid_tags

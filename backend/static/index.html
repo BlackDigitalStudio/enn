@@ -3,623 +3,262 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agentic GraphRAG</title>
+<title>GraphRAG</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--orange:#d29922}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-a{color:var(--accent);text-decoration:none}
+:root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--user-bg:#1c2d4a;--ai-bg:#1c1c2e;--green:#3fb950;--red:#f85149}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;flex-direction:column}
 
-/* Layout */
-.app{display:grid;grid-template-columns:280px 1fr;grid-template-rows:56px 1fr;height:100vh}
-header{grid-column:1/-1;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:16px}
-header h1{font-size:16px;font-weight:600}
-header .status{margin-left:auto;display:flex;gap:12px;font-size:12px}
-header .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
-header .dot.ok{background:var(--green)}
-header .dot.err{background:var(--red)}
+/* Header */
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:12px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0}
+header h1{font-size:15px;font-weight:600;letter-spacing:.3px}
+header .status{margin-left:auto;font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px}
+header .dot{width:7px;height:7px;border-radius:50%;background:var(--green)}
+header .dot.off{background:var(--red)}
 
-nav{background:var(--surface);border-right:1px solid var(--border);padding:12px;overflow-y:auto}
-nav button{width:100%;text-align:left;background:none;border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:6px;cursor:pointer;margin-bottom:6px;font-size:13px;transition:background .15s}
-nav button:hover,nav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-nav h3{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin:16px 0 8px 4px}
+/* Chat area */
+.chat{flex:1;overflow-y:auto;padding:20px 20px 10px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:75%;padding:12px 16px;border-radius:16px;font-size:14px;line-height:1.55;word-wrap:break-word;white-space:pre-wrap}
+.msg.user{align-self:flex-end;background:var(--user-bg);border-bottom-right-radius:4px}
+.msg.ai{align-self:flex-start;background:var(--ai-bg);border:1px solid var(--border);border-bottom-left-radius:4px}
+.msg.ai .sources{margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}
+.msg.ai .metrics{font-size:10px;color:var(--muted);margin-top:6px;opacity:.7}
+.msg.system{align-self:center;background:none;color:var(--muted);font-size:12px;padding:4px 12px}
+.typing{align-self:flex-start;color:var(--muted);font-size:13px;padding:8px 16px}
+.typing::after{content:'...';animation:dots 1.4s infinite}
+@keyframes dots{0%,20%{content:'.'}40%{content:'..'}60%,100%{content:'...'}}
 
-main{padding:20px;overflow-y:auto}
-.panel{display:none}
-.panel.active{display:block}
+/* Input area */
+.input-area{background:var(--surface);border-top:1px solid var(--border);padding:12px 16px;display:flex;gap:8px;align-items:flex-end;flex-shrink:0}
+.input-area textarea{flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:12px;font-size:14px;font-family:inherit;resize:none;max-height:120px;min-height:42px;line-height:1.4;outline:none;transition:border-color .2s}
+.input-area textarea:focus{border-color:var(--accent)}
+.input-area textarea::placeholder{color:var(--muted)}
 
-/* Components */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
-.card h3{font-size:14px;margin-bottom:8px}
-input,textarea,select{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;width:100%;font-size:13px;font-family:inherit}
-textarea{resize:vertical;min-height:80px;font-family:'Cascadia Code',monospace,monospace}
-button.btn{background:var(--accent);color:#fff;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
-button.btn:hover{opacity:.9}
-button.btn.danger{background:var(--red)}
-button.btn.secondary{background:var(--border);color:var(--text)}
-.row{display:flex;gap:8px;margin-bottom:8px;align-items:end}
-.row>*{flex:1}
-label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
-pre{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;overflow-x:auto;font-size:12px;font-family:'Cascadia Code',monospace;white-space:pre-wrap;max-height:400px;overflow-y:auto}
-.tag{display:inline-block;background:var(--border);color:var(--muted);padding:2px 8px;border-radius:12px;font-size:11px;margin:2px}
-.tag.type{background:#1f3a5f;color:var(--accent)}
-.score{color:var(--orange);font-weight:600}
-.result-item{padding:10px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .1s}
-.result-item:hover{background:rgba(88,166,255,.1)}
-.result-item .name{font-weight:600}
-.result-item .meta{font-size:12px;color:var(--muted)}
-.empty{color:var(--muted);text-align:center;padding:40px;font-style:italic}
-#output{margin-top:12px}
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
-.stat-card{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:16px;text-align:center}
-.stat-card .num{font-size:28px;font-weight:700;color:var(--accent)}
-.stat-card .label{font-size:11px;color:var(--muted);margin-top:4px}
+/* Buttons */
+.btn-icon{background:none;border:1px solid var(--border);color:var(--muted);width:42px;height:42px;border-radius:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all .15s;flex-shrink:0}
+.btn-icon:hover{border-color:var(--accent);color:var(--accent)}
+.btn-icon.send{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn-icon.send:hover{opacity:.85}
+.btn-icon svg{width:18px;height:18px}
+
+/* Pipeline progress */
+.pipeline-bar{background:var(--surface);border-bottom:1px solid var(--border);padding:8px 20px;font-size:12px;color:var(--muted);display:none;align-items:center;gap:10px}
+.pipeline-bar.active{display:flex}
+.pipeline-bar .progress{flex:1;height:4px;background:var(--border);border-radius:2px;overflow:hidden}
+.pipeline-bar .progress .fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s}
+
+/* Modal */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}
+.modal-overlay.active{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:90vw}
+.modal h2{font-size:16px;margin-bottom:16px}
+.modal input{background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px 14px;border-radius:8px;width:100%;font-size:14px;margin-bottom:12px}
+.modal .btn{background:var(--accent);color:#fff;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;width:100%}
+.modal .btn:hover{opacity:.85}
+.modal .hint{font-size:12px;color:var(--muted);margin-bottom:12px}
 </style>
 </head>
 <body>
-<div class="app">
 
 <header>
-  <h1>Agentic GraphRAG</h1>
-  <span style="color:var(--muted);font-size:12px">M2M Knowledge Graph</span>
-  <div class="status" id="headerStatus"></div>
+  <h1>🧠 GraphRAG</h1>
+  <div class="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">connecting...</span>
+  </div>
 </header>
 
-<nav>
-  <h3>Pipeline</h3>
-  <button onclick="showPanel('ingest')" id="nav-ingest">Ingest (Load Code)</button>
-  <button onclick="showPanel('embeddings')" id="nav-embeddings">Index Embeddings</button>
-  <button onclick="showPanel('summaries')" id="nav-summaries">Generate Summaries</button>
-
-  <h3>Search</h3>
-  <button onclick="showPanel('vector')" id="nav-vector">Vector Search</button>
-  <button onclick="showPanel('text')" id="nav-text">Text Search</button>
-
-  <h3>Navigate</h3>
-  <button onclick="showPanel('subgraph')" id="nav-subgraph">Subgraph Explorer</button>
-  <button onclick="showPanel('code')" id="nav-code">View Code</button>
-
-  <h3>Agent Tools</h3>
-  <button onclick="showPanel('scratchpad')" id="nav-scratchpad">Scratchpad</button>
-  <button onclick="showPanel('shadow')" id="nav-shadow">Shadow Graph</button>
-  <button onclick="showPanel('llm')" id="nav-llm">LLM Test</button>
-
-  <h3>System</h3>
-  <button onclick="showPanel('dashboard')" id="nav-dashboard" class="active">Dashboard</button>
-  <button onclick="clearAll()" style="border-color:var(--red);color:var(--red)">Clear All Data</button>
-</nav>
-
-<main>
-
-<!-- Dashboard -->
-<div class="panel active" id="panel-dashboard">
-  <h2 style="margin-bottom:16px">Dashboard</h2>
-  <div class="stats-grid" id="statsGrid"></div>
-  <div class="card" style="margin-top:16px">
-    <h3>Quick Start</h3>
-    <ol style="padding-left:20px;line-height:2;color:var(--muted);font-size:13px">
-      <li><b>Ingest</b> — загрузить C++/Markdown проект в граф</li>
-      <li><b>Index Embeddings</b> — сгенерировать векторные представления</li>
-      <li><b>Generate Summaries</b> — LLM описания для каждого узла</li>
-      <li><b>Vector Search</b> — найти стартовый узел по промпту</li>
-      <li><b>Subgraph Explorer</b> — навигация по графу от узла</li>
-      <li><b>View Code</b> — полный исходный код узла</li>
-    </ol>
-  </div>
+<div class="pipeline-bar" id="pipelineBar">
+  <span id="pipelineText">Pipeline: idle</span>
+  <div class="progress"><div class="fill" id="pipelineFill" style="width:0%"></div></div>
 </div>
 
-<!-- Ingest -->
-<div class="panel" id="panel-ingest">
-  <h2 style="margin-bottom:16px">Загрузить проект</h2>
-
-  <!-- Drag & Drop -->
-  <div class="card" id="dropZone" style="border:2px dashed var(--accent);text-align:center;padding:40px;cursor:pointer;transition:background .2s"
-    ondragover="event.preventDefault();this.style.background='rgba(88,166,255,0.1)'"
-    ondragleave="this.style.background=''"
-    ondrop="handleDrop(event)"
-    onclick="document.getElementById('fileInput').click()">
-    <div style="font-size:32px;margin-bottom:8px">📁</div>
-    <div style="font-size:16px;font-weight:600">Перетащи ZIP-архив сюда</div>
-    <div style="color:var(--muted);font-size:13px;margin-top:4px">или нажми чтобы выбрать файл</div>
-    <input type="file" id="fileInput" accept=".zip" style="display:none" onchange="handleFileSelect(this)">
-  </div>
-
-  <!-- Progress -->
-  <div id="pipelineProgress" style="display:none">
-    <div class="card">
-      <div id="pipelineSteps"></div>
-      <div style="margin-top:12px;height:4px;background:var(--border);border-radius:2px;overflow:hidden">
-        <div id="pipelineBar" style="height:100%;background:var(--accent);width:0%;transition:width .5s"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Result -->
-  <div id="ingestResult"></div>
-
-  <!-- Manual path (collapsed) -->
-  <details style="margin-top:12px">
-    <summary style="color:var(--muted);cursor:pointer;font-size:12px">Ручной ввод пути (для продвинутых)</summary>
-    <div class="card" style="margin-top:8px">
-      <div class="row">
-        <input id="ingestDir" value="/app/test_data/cpp_project" placeholder="/app/test_data/cpp_project">
-        <button class="btn secondary" onclick="doManualPipeline()" style="flex:none">Run Pipeline</button>
-      </div>
-    </div>
-  </details>
+<div class="chat" id="chat">
+  <div class="msg system">Добро пожаловать. Задайте вопрос по загруженной базе знаний.</div>
 </div>
 
-<!-- Embeddings -->
-<div class="panel" id="panel-embeddings">
-  <h2 style="margin-bottom:16px">Index Embeddings</h2>
-  <div class="card">
-    <p style="color:var(--muted);margin-bottom:12px">Генерирует векторные представления всех узлов через Gemini Embedding API и сохраняет в Qdrant.</p>
-    <button class="btn" onclick="doEmbeddings()">Generate Embeddings</button>
-  </div>
-  <div id="embResult"></div>
+<div class="input-area">
+  <!-- Add project button -->
+  <button class="btn-icon" onclick="showProjectModal()" title="Добавить проект">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>
+  </button>
+
+  <!-- File upload button -->
+  <button class="btn-icon" onclick="document.getElementById('fileInput').click()" title="Отправить файлы">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+  </button>
+  <input type="file" id="fileInput" multiple hidden onchange="uploadFiles(this.files)">
+
+  <textarea id="input" placeholder="Задайте вопрос..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+
+  <button class="btn-icon send" onclick="sendMessage()" title="Отправить">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+  </button>
 </div>
 
-<!-- Summaries -->
-<div class="panel" id="panel-summaries">
-  <h2 style="margin-bottom:16px">Generate Summaries</h2>
-  <div class="card">
-    <p style="color:var(--muted);margin-bottom:12px">LLM генерирует краткие описания для каждого узла (при индексации, НЕ при навигации).</p>
-    <button class="btn" onclick="doSummaries()">Generate via Gemini</button>
+<!-- Add Project Modal -->
+<div class="modal-overlay" id="projectModal">
+  <div class="modal">
+    <h2>📁 Добавить проект</h2>
+    <div class="hint">Укажите путь к директории на сервере (внутри Docker-контейнера)</div>
+    <input id="projectPath" placeholder="/app/test_data/ranobe" value="/app/test_data/ranobe">
+    <button class="btn" onclick="startPipeline()">Запустить индексацию</button>
   </div>
-  <div id="sumResult"></div>
-</div>
-
-<!-- Vector Search -->
-<div class="panel" id="panel-vector">
-  <h2 style="margin-bottom:16px">Vector Search — Входная точка агента</h2>
-  <div class="card">
-    <label>Текстовый запрос</label>
-    <div class="row">
-      <input id="vecQuery" placeholder="collision detection between objects">
-      <button class="btn" onclick="doVectorSearch()" style="flex:none">Search</button>
-    </div>
-  </div>
-  <div id="vecResults"></div>
-</div>
-
-<!-- Text Search -->
-<div class="panel" id="panel-text">
-  <h2 style="margin-bottom:16px">Text Search</h2>
-  <div class="card">
-    <div class="row">
-      <div><label>Query</label><input id="txtQuery" placeholder="PhysicsWorld"></div>
-      <div><label>Type</label><select id="txtType"><option value="">All</option><option>class</option><option>function</option><option>document</option></select></div>
-      <button class="btn" onclick="doTextSearch()" style="flex:none;align-self:end">Search</button>
-    </div>
-  </div>
-  <div id="txtResults"></div>
-</div>
-
-<!-- Subgraph -->
-<div class="panel" id="panel-subgraph">
-  <h2 style="margin-bottom:16px">Subgraph Explorer</h2>
-  <div class="card">
-    <div class="row">
-      <div style="flex:3"><label>Node ID</label><input id="sgNodeId" placeholder="class::PhysicsWorld#27b1a765"></div>
-      <div style="flex:1"><label>Depth</label><select id="sgDepth"><option>1</option><option selected>2</option><option>3</option></select></div>
-      <button class="btn" onclick="doSubgraph()" style="flex:none;align-self:end">Explore</button>
-    </div>
-  </div>
-  <div id="sgResult"></div>
-</div>
-
-<!-- Code -->
-<div class="panel" id="panel-code">
-  <h2 style="margin-bottom:16px">View Code</h2>
-  <div class="card">
-    <label>Node ID</label>
-    <div class="row">
-      <input id="codeNodeId" placeholder="class::RigidBody#21119d34">
-      <button class="btn" onclick="doGetCode()" style="flex:none">Get Code</button>
-    </div>
-  </div>
-  <div id="codeResult"></div>
-</div>
-
-<!-- Scratchpad -->
-<div class="panel" id="panel-scratchpad">
-  <h2 style="margin-bottom:16px">Scratchpad — Память агента</h2>
-  <div class="card">
-    <div class="row">
-      <div><label>Session ID</label><input id="spSession" value="agent-001"></div>
-    </div>
-    <label>Content</label>
-    <textarea id="spContent" placeholder="Plan: refactor collision detection..."></textarea>
-    <label style="margin-top:8px">Node IDs (comma-separated)</label>
-    <input id="spNodes" placeholder="class::PhysicsWorld#abc, function::step#def">
-    <div class="row" style="margin-top:8px">
-      <button class="btn" onclick="doSpWrite()">Write</button>
-      <button class="btn secondary" onclick="doSpRead()">Read All</button>
-      <button class="btn danger" onclick="doSpClear()">Clear</button>
-    </div>
-  </div>
-  <div id="spResult"></div>
-</div>
-
-<!-- Shadow Graph -->
-<div class="panel" id="panel-shadow">
-  <h2 style="margin-bottom:16px">Shadow Graph — Virtual Patches</h2>
-  <div class="card">
-    <div class="row">
-      <div><label>Session ID</label><input id="shSession" value="agent-001"></div>
-      <div><label>Node ID</label><input id="shNodeId" placeholder="function::..."></div>
-    </div>
-    <div class="row">
-      <div><label>Old Code</label><textarea id="shOld" rows="2"></textarea></div>
-      <div><label>New Code</label><textarea id="shNew" rows="2"></textarea></div>
-    </div>
-    <div class="row">
-      <button class="btn" onclick="doShCreate()">Create Patch</button>
-      <button class="btn secondary" onclick="doShView()">View Patched Code</button>
-      <button class="btn secondary" onclick="doShList()">List Patches</button>
-    </div>
-  </div>
-  <div id="shResult"></div>
-</div>
-
-<!-- LLM Test -->
-<div class="panel" id="panel-llm">
-  <h2 style="margin-bottom:16px">LLM Test</h2>
-  <div class="card">
-    <label>Prompt</label>
-    <textarea id="llmPrompt" placeholder="What does PhysicsWorld::step do?"></textarea>
-    <button class="btn" style="margin-top:8px" onclick="doLlmTest()">Send to Gemini</button>
-  </div>
-  <div id="llmResult"></div>
-</div>
-
-</main>
 </div>
 
 <script>
 const API = '/api/v1';
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
 
-// Navigation
-function showPanel(name) {
-  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
-  document.getElementById('panel-' + name).classList.add('active');
-  const btn = document.getElementById('nav-' + name);
-  if (btn) btn.classList.add('active');
+// Auto-resize textarea
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
 
-// API helper
-async function api(method, path, body) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(API + path, opts);
-  return res.json();
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 }
 
-function renderJson(data) {
-  return '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
-}
-
-function renderCard(html) {
-  return '<div class="card">' + html + '</div>';
-}
-
-// Dashboard
-async function loadDashboard() {
-  const [health, stats] = await Promise.all([
-    api('GET', '/health'),
-    api('GET', '/stats').catch(() => ({ total_nodes: 0, total_edges: 0, node_types: [] }))
-  ]);
-
-  document.getElementById('headerStatus').innerHTML = `
-    <span><span class="dot ${health.neo4j_connected ? 'ok' : 'err'}"></span>Neo4j</span>
-    <span><span class="dot ${health.llm_configured ? 'ok' : 'err'}"></span>${health.llm_model}</span>
-    <span><span class="dot ok"></span>Qdrant</span>
-  `;
-
-  document.getElementById('statsGrid').innerHTML = `
-    <div class="stat-card"><div class="num">${stats.total_nodes}</div><div class="label">Nodes</div></div>
-    <div class="stat-card"><div class="num">${stats.total_edges}</div><div class="label">Edges</div></div>
-    <div class="stat-card"><div class="num">${(stats.node_types||[]).length}</div><div class="label">Node Types</div></div>
-    <div class="stat-card"><div class="num">${health.llm_provider}</div><div class="label">LLM Provider</div></div>
-  `;
-}
-
-// Ingest
-// File upload & auto-pipeline
-function handleDrop(e) {
-  e.preventDefault();
-  e.target.closest('#dropZone').style.background = '';
-  const file = e.dataTransfer.files[0];
-  if (file) uploadAndProcess(file);
-}
-function handleFileSelect(input) {
-  if (input.files[0]) uploadAndProcess(input.files[0]);
-}
-
-async function uploadAndProcess(file) {
-  const progress = document.getElementById('pipelineProgress');
-  const steps = document.getElementById('pipelineSteps');
-  const bar = document.getElementById('pipelineBar');
-  const result = document.getElementById('ingestResult');
-
-  progress.style.display = 'block';
-  result.innerHTML = '';
-  bar.style.width = '0%';
-
-  const stepNames = ['Uploading', 'Scanning & filtering', 'Converting TXT to MD', 'Parsing code & docs', 'Generating embeddings', 'Generating summaries'];
-
-  function setStep(idx, status) {
-    let html = '';
-    for (let i = 0; i < stepNames.length; i++) {
-      const icon = i < idx ? '<span style="color:var(--green)">done</span>' :
-                   i === idx ? (status === 'error' ? '<span style="color:var(--red)">error</span>' : '<span style="color:var(--accent)">...</span>') :
-                   '<span style="color:var(--muted)">-</span>';
-      const color = i < idx ? 'var(--green)' : i === idx ? 'var(--text)' : 'var(--muted)';
-      html += '<div style="padding:4px 0;color:' + color + '">' + icon + ' ' + stepNames[i] + '</div>';
+function addMsg(text, type, extra) {
+  const div = document.createElement('div');
+  div.className = `msg ${type}`;
+  div.textContent = text;
+  if (extra) {
+    if (extra.sources) {
+      const s = document.createElement('div');
+      s.className = 'sources';
+      s.textContent = '📎 ' + extra.sources.map(s => `${s.type}:${s.name}`).slice(0, 5).join(', ');
+      div.appendChild(s);
     }
-    steps.innerHTML = html;
-    bar.style.width = Math.round((idx / stepNames.length) * 100) + '%';
+    if (extra.metrics) {
+      const m = document.createElement('div');
+      m.className = 'metrics';
+      m.textContent = `⏱ ${extra.metrics.total_time_s}s | 🔢 ${extra.metrics.total_tokens} tok | 📊 ${extra.metrics.context_nodes} nodes`;
+      div.appendChild(m);
+    }
   }
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+  return div;
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  input.style.height = 'auto';
+
+  addMsg(text, 'user');
+  const typing = document.createElement('div');
+  typing.className = 'typing';
+  typing.textContent = 'Думаю';
+  chat.appendChild(typing);
+  chat.scrollTop = chat.scrollHeight;
 
   try {
-    // Step 1: Upload
-    setStep(0);
-    const formData = new FormData();
-    formData.append('file', file);
-    const uploadRes = await fetch(API + '/upload', { method: 'POST', body: formData });
-    const uploadData = await uploadRes.json();
-    if (!uploadRes.ok) throw new Error(uploadData.detail || 'Upload failed');
-
-    // Steps 2-5: Auto-pipeline
-    setStep(1);
-    const pipeRes = await fetch(API + '/pipeline', {
+    const res = await fetch(`${API}/agent/query`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_name: uploadData.project_name })
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: text, top_k: 10, depth: 1})
     });
-    const pipeData = await pipeRes.json();
-    if (!pipeRes.ok) throw new Error(pipeData.detail || 'Pipeline failed');
-
-    setStep(6); // All done
-    bar.style.width = '100%';
-
-    result.innerHTML = renderCard(`
-      <h3 style="color:var(--green)">Project loaded successfully</h3>
-      <div class="stats-grid" style="margin-top:12px">
-        <div class="stat-card"><div class="num">${pipeData.total_files}</div><div class="label">Files</div></div>
-        <div class="stat-card"><div class="num">${pipeData.total_nodes}</div><div class="label">Nodes</div></div>
-        <div class="stat-card"><div class="num">${pipeData.total_edges}</div><div class="label">Edges</div></div>
-      </div>
-      ${pipeData.steps ? '<pre style="margin-top:12px;font-size:11px">' + JSON.stringify(pipeData.steps, null, 2) + '</pre>' : ''}
-      ${pipeData.errors && pipeData.errors.length ? '<pre style="color:var(--red);margin-top:8px">' + pipeData.errors.join('\\n') + '</pre>' : ''}
-    `);
-    loadDashboard();
-  } catch (err) {
-    setStep(0, 'error');
-    result.innerHTML = renderCard('<h3 style="color:var(--red)">Error</h3><pre>' + escHtml(err.message) + '</pre>');
+    typing.remove();
+    if (!res.ok) {
+      const err = await res.json();
+      addMsg('❌ ' + (err.detail || 'Ошибка'), 'ai');
+      return;
+    }
+    const data = await res.json();
+    addMsg(data.answer, 'ai', {sources: data.sources, metrics: data.metrics});
+  } catch(e) {
+    typing.remove();
+    addMsg('❌ Нет связи с сервером', 'ai');
   }
 }
 
-async function doManualPipeline() {
-  const dir = document.getElementById('ingestDir').value;
-  const result = document.getElementById('ingestResult');
-  const progress = document.getElementById('pipelineProgress');
-  const steps = document.getElementById('pipelineSteps');
-  const bar = document.getElementById('pipelineBar');
+// Upload files
+async function uploadFiles(files) {
+  for (const file of files) {
+    addMsg(`📎 Загружаю: ${file.name}`, 'system');
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      const res = await fetch(`${API}/upload`, {method: 'POST', body: form});
+      const data = await res.json();
+      addMsg(`✅ ${file.name}: ${data.scan?.total_scanned || '?'} файлов найдено`, 'system');
+    } catch(e) {
+      addMsg(`❌ Ошибка загрузки ${file.name}`, 'system');
+    }
+  }
+}
 
-  progress.style.display = 'block';
-  result.innerHTML = '';
-  steps.innerHTML = '<div style="color:var(--accent)">Running pipeline...</div>';
-  bar.style.width = '20%';
+// Project modal
+function showProjectModal() {
+  document.getElementById('projectModal').classList.add('active');
+}
+document.getElementById('projectModal').addEventListener('click', function(e) {
+  if (e.target === this) this.classList.remove('active');
+});
+
+async function startPipeline() {
+  const dir = document.getElementById('projectPath').value.trim();
+  if (!dir) return;
+  document.getElementById('projectModal').classList.remove('active');
+
+  const bar = document.getElementById('pipelineBar');
+  const fill = document.getElementById('pipelineFill');
+  const pText = document.getElementById('pipelineText');
+  bar.classList.add('active');
+  pText.textContent = 'Pipeline: запуск...';
+  fill.style.width = '5%';
+
+  addMsg(`🚀 Индексация: ${dir}`, 'system');
 
   try {
-    const res = await fetch(API + '/pipeline', {
+    const res = await fetch(`${API}/pipeline`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ directory: dir })
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({directory: dir})
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Failed');
-
-    bar.style.width = '100%';
-    steps.innerHTML = '<div style="color:var(--green)">All steps completed</div>';
-    result.innerHTML = renderCard(`
-      <h3 style="color:var(--green)">Done</h3>
-      <p>Files: ${data.total_files} | Nodes: ${data.total_nodes} | Edges: ${data.total_edges}</p>
-      <pre style="font-size:11px">${JSON.stringify(data.steps, null, 2)}</pre>
-    `);
-    loadDashboard();
-  } catch (err) {
-    bar.style.width = '0%';
-    result.innerHTML = renderCard('<p style="color:var(--red)">' + escHtml(err.message) + '</p>');
+    fill.style.width = '100%';
+    if (data.success) {
+      pText.textContent = `Pipeline: готово (${data.total_nodes} узлов, ${data.total_edges} рёбер, ${data.total_time_s}s)`;
+      addMsg(`✅ Индексация завершена: ${data.total_nodes} узлов, ${data.total_edges} рёбер за ${data.total_time_s}s`, 'system');
+    } else {
+      pText.textContent = 'Pipeline: ошибка';
+      addMsg('❌ Ошибка pipeline: ' + JSON.stringify(data.errors?.slice(0,3)), 'system');
+    }
+    setTimeout(() => bar.classList.remove('active'), 8000);
+  } catch(e) {
+    pText.textContent = 'Pipeline: ошибка связи';
+    fill.style.width = '0%';
+    addMsg('❌ Нет связи с сервером', 'system');
   }
 }
 
-async function doIngest() { doManualPipeline(); }
-
-// Embeddings
-async function doEmbeddings() {
-  document.getElementById('embResult').innerHTML = '<p style="color:var(--muted)">Generating embeddings via Gemini...</p>';
-  const data = await api('POST', '/index/embeddings');
-  document.getElementById('embResult').innerHTML = renderCard(`
-    <h3 style="color:var(--green)">Done</h3>
-    <p>Indexed: ${data.indexed} / ${data.total_nodes} nodes</p>
-  `);
-}
-
-// Summaries
-async function doSummaries() {
-  document.getElementById('sumResult').innerHTML = '<p style="color:var(--muted)">Generating summaries via Gemini (may take 30-60s)...</p>';
-  const data = await api('POST', '/generate/summaries');
-  document.getElementById('sumResult').innerHTML = renderCard(`
-    <h3 style="color:var(--green)">Done</h3>
-    <p>Updated: ${data.updated} / ${data.total_nodes} nodes</p>
-  `);
-}
-
-// Vector Search
-async function doVectorSearch() {
-  const query = document.getElementById('vecQuery').value;
-  document.getElementById('vecResults').innerHTML = '<p style="color:var(--muted)">Searching...</p>';
-  const data = await api('POST', '/search/vector', { query, limit: 10 });
-  let html = '';
-  for (const r of data.results) {
-    html += `<div class="result-item" onclick="navigateTo('${r.node_id}')">
-      <span class="score">${r.score.toFixed(3)}</span>
-      <span class="tag type">${r.type}</span>
-      <span class="name">${r.name}</span>
-      <div class="meta">${r.summary || ''}</div>
-      <div class="meta" style="font-family:monospace;font-size:11px">${r.node_id}</div>
-    </div>`;
+// Health check
+async function checkHealth() {
+  try {
+    const res = await fetch(`${API}/health`);
+    const data = await res.json();
+    document.getElementById('statusDot').className = 'dot' + (data.status === 'healthy' ? '' : ' off');
+    document.getElementById('statusText').textContent = data.status === 'healthy'
+      ? `${data.llm_model} · Neo4j ✓`
+      : 'degraded';
+  } catch {
+    document.getElementById('statusDot').className = 'dot off';
+    document.getElementById('statusText').textContent = 'offline';
   }
-  document.getElementById('vecResults').innerHTML = renderCard(html || '<div class="empty">No results</div>');
 }
+checkHealth();
+setInterval(checkHealth, 30000);
 
-// Text Search
-async function doTextSearch() {
-  const query = document.getElementById('txtQuery').value;
-  const type = document.getElementById('txtType').value;
-  const body = { query, limit: 50 };
-  if (type) body.node_type = type;
-  const data = await api('POST', '/search', body);
-  let html = '';
-  for (const r of data) {
-    html += `<div class="result-item" onclick="navigateTo('${r.node_id}')">
-      <span class="tag type">${r.type}</span>
-      <span class="name">${r.name}</span>
-      <div class="meta">${r.summary}</div>
-      <div class="meta" style="font-family:monospace;font-size:11px">${r.node_id}</div>
-    </div>`;
-  }
-  document.getElementById('txtResults').innerHTML = renderCard(html || '<div class="empty">No results</div>');
-}
-
-// Navigate to node
-function navigateTo(nodeId) {
-  document.getElementById('sgNodeId').value = nodeId;
-  document.getElementById('codeNodeId').value = nodeId;
-  showPanel('subgraph');
-  doSubgraph();
-}
-
-// Subgraph
-async function doSubgraph() {
-  const nodeId = document.getElementById('sgNodeId').value;
-  const depth = document.getElementById('sgDepth').value;
-  document.getElementById('sgResult').innerHTML = '<p style="color:var(--muted)">Loading...</p>';
-  const data = await api('GET', '/subgraph/' + encodeURIComponent(nodeId) + '?depth=' + depth);
-  if (data.detail) {
-    document.getElementById('sgResult').innerHTML = renderCard('<p style="color:var(--red)">' + data.detail + '</p>');
-    return;
-  }
-  let html = `<h3>Center: <span class="tag type">${data.center_node.type}</span> ${data.center_node.name}</h3>
-    <p style="color:var(--muted);margin:8px 0">Summary: ${data.center_node.summary || 'N/A'}</p>
-    <h3 style="margin-top:16px">Nodes (${data.nodes.length})</h3>`;
-  for (const n of data.nodes) {
-    html += `<div class="result-item" onclick="navigateTo('${n.node_id}')">
-      <span class="tag type">${n.type}</span> <span class="name">${n.name}</span>
-      <div class="meta">${n.summary || ''}</div>
-    </div>`;
-  }
-  html += `<h3 style="margin-top:16px">Edges (${data.edges.length})</h3>`;
-  for (const e of data.edges) {
-    const src = e.source_id.split('#')[0].split('::')[1];
-    const tgt = e.target_id.split('#')[0].split('::')[1];
-    html += `<div style="padding:4px 0;font-size:13px;font-family:monospace">${src} <span style="color:var(--orange)">--[${e.type}]--></span> ${tgt}</div>`;
-  }
-  document.getElementById('sgResult').innerHTML = renderCard(html);
-}
-
-// Code
-async function doGetCode() {
-  const nodeId = document.getElementById('codeNodeId').value;
-  const data = await api('GET', '/node/' + encodeURIComponent(nodeId) + '/code');
-  if (data.detail) {
-    document.getElementById('codeResult').innerHTML = renderCard('<p style="color:var(--red)">' + data.detail + '</p>');
-    return;
-  }
-  document.getElementById('codeResult').innerHTML = renderCard(`
-    <p style="color:var(--muted);font-size:12px">${data.file_path} : ${data.line_start}-${data.line_end}</p>
-    <pre>${escHtml(data.source_code)}</pre>
-  `);
-}
-
-// Scratchpad
-async function doSpWrite() {
-  const session_id = document.getElementById('spSession').value;
-  const content = document.getElementById('spContent').value;
-  const nodeStr = document.getElementById('spNodes').value;
-  const node_ids = nodeStr ? nodeStr.split(',').map(s => s.trim()) : [];
-  const data = await api('POST', '/scratchpad', { session_id, content, node_ids });
-  document.getElementById('spResult').innerHTML = renderCard(renderJson(data));
-}
-async function doSpRead() {
-  const sid = document.getElementById('spSession').value;
-  const data = await api('GET', '/scratchpad/' + sid);
-  let html = `<h3>Entries: ${data.count}</h3>`;
-  for (const e of data.entries) {
-    html += `<div style="border-bottom:1px solid var(--border);padding:8px 0">
-      <pre>${escHtml(e.content)}</pre>
-      <div class="meta">Nodes: ${e.node_ids.join(', ') || 'none'} | ${e.created_at}</div>
-    </div>`;
-  }
-  document.getElementById('spResult').innerHTML = renderCard(html);
-}
-async function doSpClear() {
-  const sid = document.getElementById('spSession').value;
-  const data = await api('DELETE', '/scratchpad/' + sid);
-  document.getElementById('spResult').innerHTML = renderCard(renderJson(data));
-}
-
-// Shadow Graph
-async function doShCreate() {
-  const data = await api('POST', '/patches', {
-    session_id: document.getElementById('shSession').value,
-    node_id: document.getElementById('shNodeId').value,
-    file_path: '',
-    old_code: document.getElementById('shOld').value,
-    new_code: document.getElementById('shNew').value,
-  });
-  document.getElementById('shResult').innerHTML = renderCard(renderJson(data));
-}
-async function doShView() {
-  const nodeId = document.getElementById('shNodeId').value;
-  const sid = document.getElementById('shSession').value;
-  const data = await api('GET', '/node/' + encodeURIComponent(nodeId) + '/code/shadow?session_id=' + sid);
-  document.getElementById('shResult').innerHTML = renderCard(`
-    <p>Patched: <b style="color:${data.patched ? 'var(--green)' : 'var(--muted)'}">${data.patched}</b></p>
-    <pre>${escHtml(data.source_code || '')}</pre>
-  `);
-}
-async function doShList() {
-  const sid = document.getElementById('shSession').value;
-  const data = await api('GET', '/patches/' + sid);
-  document.getElementById('shResult').innerHTML = renderCard(renderJson(data));
-}
-
-// LLM
-async function doLlmTest() {
-  const prompt = document.getElementById('llmPrompt').value;
-  document.getElementById('llmResult').innerHTML = '<p style="color:var(--muted)">Thinking...</p>';
-  const data = await api('POST', '/llm/test', { prompt });
-  document.getElementById('llmResult').innerHTML = renderCard(`
-    <p style="color:var(--muted);font-size:12px">${data.provider}/${data.model}</p>
-    <pre>${escHtml(data.response || data.detail || '')}</pre>
-  `);
-}
-
-// Clear
-async function clearAll() {
-  if (!confirm('Delete ALL data (graph + vectors + patches)?')) return;
-  await api('DELETE', '/clear');
-  loadDashboard();
-  alert('Cleared');
-}
-
-function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-loadDashboard();
+// Stats on load
+fetch(`${API}/stats`).then(r=>r.json()).then(d=>{
+  if(d.total_nodes>0) addMsg(`📊 База: ${d.total_nodes} узлов, ${d.total_edges} рёбер, типы: ${d.node_types?.join(', ')}`, 'system');
+}).catch(()=>{});
 </script>
 </body>
 </html>

@@ -21,8 +21,7 @@ class Settings(BaseSettings):
     llm_provider: str = "openai"
     llm_api_key: str = ""
     llm_model: str = "deepseek-chat"
-    llm_base_url_default: str = "https://api.deepseek.com/v1/chat/completions"
-    llm_base_url: Optional[str] = None  # Для кастомных endpoint'ов
+    llm_base_url: Optional[str] = "https://api.deepseek.com/v1/chat/completions"
 
     # Application Settings
     app_name: str = "Agentic GraphRAG"

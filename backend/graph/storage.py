@@ -297,10 +297,12 @@ class Neo4jStorage:
         cypher = f"""
         MATCH path = (start:Node {{node_id: $node_id}}){left}[*1..{max_depth}]{right}(end:Node)
         {type_filter}
-        WITH nodes(path) AS path_nodes, relationships(path) AS path_edges
-        UNWIND path_nodes AS n
-        WITH collect(DISTINCT n) AS unique_nodes, path_edges
-        UNWIND path_edges AS e
+        WITH collect(nodes(path)) AS all_path_nodes, collect(relationships(path)) AS all_path_edges
+        WITH reduce(acc = [], ns IN all_path_nodes | acc + ns) AS flat_nodes,
+             reduce(acc = [], es IN all_path_edges | acc + es) AS flat_edges
+        UNWIND flat_nodes AS n
+        WITH collect(DISTINCT n) AS unique_nodes, flat_edges
+        UNWIND flat_edges AS e
         WITH unique_nodes, collect(DISTINCT e) AS unique_edges
         RETURN unique_nodes, unique_edges
         """
@@ -415,12 +417,13 @@ class Neo4jStorage:
     def get_stats(self) -> Dict[str, Any]:
         """Получение статистики графа"""
         cypher = """
-        MATCH (n:Node)
-        OPTIONAL MATCH ()-[e]->()
-        RETURN count(DISTINCT n) as node_count,
-               count(DISTINCT labels(n)) as type_count,
-               count(e) as edge_count,
-               collect(DISTINCT n.type) as types
+        CALL {
+            MATCH (n:Node) RETURN count(n) as node_count, collect(DISTINCT n.type) as types
+        }
+        CALL {
+            MATCH ()-[e]->() RETURN count(e) as edge_count
+        }
+        RETURN node_count, edge_count, types, size(types) as type_count
         """
         
         with self._driver.session(database=self.database) as session:

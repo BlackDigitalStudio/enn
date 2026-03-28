@@ -95,7 +95,7 @@ class VectorStore:
             return False
 
     def _node_id_to_int(self, node_id: str) -> int:
-        return int(hashlib.md5(node_id.encode()).hexdigest()[:15], 16)
+        return int(hashlib.sha256(node_id.encode()).hexdigest()[:16], 16)
 
     def upsert_node(
         self,

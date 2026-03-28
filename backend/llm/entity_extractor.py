@@ -177,79 +177,121 @@ async def extract_entities_single(
         return [], []
 
 
+async def _process_one_batch(
+    llm_client,
+    batch: List[Dict[str, Any]],
+    batch_idx: int,
+    total: int,
+) -> Tuple[List[ExtractedEntity], List[ExtractedEdge]]:
+    """Process a single batch of items through LLM. Called in parallel."""
+    entities = []
+    edges = []
+
+    items_text = ""
+    for idx, item in enumerate(batch):
+        content = (item.get("content") or "")[:2000]
+        items_text += f"\n--- ITEM {idx+1} (id: {item['node_id']}, type: {item['type']}) ---\n"
+        items_text += f"Name: {item['name']}\n"
+        items_text += f"Content:\n{content}\n"
+
+    prompt = BATCH_EXTRACTION_PROMPT.format(
+        count=len(batch),
+        items_text=items_text,
+    )
+
+    try:
+        response = await llm_client.generate(prompt)
+        if not response:
+            return entities, edges
+
+        results = _parse_json_response(response)
+        if not results:
+            return entities, edges
+
+        if isinstance(results, dict):
+            results = [results]
+
+        for result in results:
+            src_id = result.get("source_id", "")
+
+            for e in result.get("entities", []):
+                conf = float(e.get("confidence", 0))
+                if conf < 0.3:
+                    continue
+                entities.append(ExtractedEntity(
+                    name=e["name"].lower().strip(),
+                    type=e.get("type", "entity"),
+                    summary=e.get("summary", ""),
+                    confidence=conf,
+                    source_node_id=src_id,
+                ))
+
+            for ed in result.get("edges", []):
+                w = float(ed.get("weight", 0.5))
+                if w < 0.2:
+                    continue
+                edges.append(ExtractedEdge(
+                    source_name=ed["source"].lower().strip(),
+                    target_name=ed["target"].lower().strip(),
+                    edge_type=ed.get("type", "RELATES_TO"),
+                    weight=w,
+                    source_node_id=src_id,
+                ))
+
+    except Exception as e:
+        logger.error(f"Batch extraction failed (batch {batch_idx}): {e}")
+
+    return entities, edges
+
+
 async def extract_entities_batch(
     llm_client,
     items: List[Dict[str, Any]],
-    batch_size: int = 10,
+    batch_size: int = 50,
+    concurrency: int = 10,
 ) -> Tuple[List[ExtractedEntity], List[ExtractedEdge]]:
     """
-    Батч-экстракция сущностей. Обрабатывает по batch_size узлов за один LLM-вызов.
+    Батч-экстракция сущностей с параллельными вызовами.
 
-    items: [{"node_id": str, "name": str, "type": str, "content": str}]
+    - batch_size: сколько файлов в одном LLM-вызове (50 ≈ 30K input tokens)
+    - concurrency: сколько вызовов отправляем одновременно (10 параллельных)
+
+    19K файлов: 384 батча → 39 раундов по 10 → ~30 мин вместо 53 часов.
     """
+    import asyncio
+
     all_entities = []
     all_edges = []
 
+    # Split items into batches
+    batches = []
     for i in range(0, len(items), batch_size):
-        batch = items[i:i + batch_size]
+        batches.append(items[i:i + batch_size])
 
-        items_text = ""
-        for idx, item in enumerate(batch):
-            content = (item.get("content") or "")[:2000]
-            items_text += f"\n--- ITEM {idx+1} (id: {item['node_id']}, type: {item['type']}) ---\n"
-            items_text += f"Name: {item['name']}\n"
-            items_text += f"Content:\n{content}\n"
+    total_items = len(items)
+    processed = 0
 
-        prompt = BATCH_EXTRACTION_PROMPT.format(
-            count=len(batch),
-            items_text=items_text,
-        )
+    # Process batches in parallel groups
+    for round_idx in range(0, len(batches), concurrency):
+        group = batches[round_idx:round_idx + concurrency]
 
-        try:
-            response = await llm_client.generate(prompt)
-            if not response:
+        tasks = [
+            _process_one_batch(llm_client, batch, round_idx + j, total_items)
+            for j, batch in enumerate(group)
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Parallel batch failed: {result}")
                 continue
+            ents, eds = result
+            all_entities.extend(ents)
+            all_edges.extend(eds)
 
-            results = _parse_json_response(response)
-            if not results:
-                continue
-
-            # Может быть список или dict
-            if isinstance(results, dict):
-                results = [results]
-
-            for result in results:
-                src_id = result.get("source_id", "")
-
-                for e in result.get("entities", []):
-                    conf = float(e.get("confidence", 0))
-                    if conf < 0.3:
-                        continue
-                    all_entities.append(ExtractedEntity(
-                        name=e["name"].lower().strip(),
-                        type=e.get("type", "entity"),
-                        summary=e.get("summary", ""),
-                        confidence=conf,
-                        source_node_id=src_id,
-                    ))
-
-                for ed in result.get("edges", []):
-                    w = float(ed.get("weight", 0.5))
-                    if w < 0.2:
-                        continue
-                    all_edges.append(ExtractedEdge(
-                        source_name=ed["source"].lower().strip(),
-                        target_name=ed["target"].lower().strip(),
-                        edge_type=ed.get("type", "RELATES_TO"),
-                        weight=w,
-                        source_node_id=src_id,
-                    ))
-
-        except Exception as e:
-            logger.error(f"Batch entity extraction failed (batch {i}): {e}")
-            continue
-
-        logger.info(f"Entity extraction: {i + len(batch)}/{len(items)} items processed")
+        processed += sum(len(b) for b in group)
+        logger.info(f"Entity extraction: {processed}/{total_items} items processed ({len(all_entities)} entities, {len(all_edges)} edges)")
 
     return all_entities, all_edges
 

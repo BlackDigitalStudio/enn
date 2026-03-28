@@ -13,13 +13,11 @@ import zipfile
 import tempfile
 import shutil
 import asyncio
-import json as _json
+import hashlib
 
 from ..graph.models import GraphNode, GraphEdge, SubgraphResult, IngestResult, VirtualPatch
 from ..graph.storage import Neo4jStorage
-from ..parser.cpp_parser import CPPSymbolExtractor, scan_directory
-from ..parser.md_parser import MarkdownParser, resolve_mentions_to_edges
-from ..parser.txt_converter import scan_and_filter, convert_txt_files
+from ..parser.txt_converter import scan_and_filter
 from ..llm.embeddings import VectorStore, get_embedding, get_embeddings_batch
 from ..llm.entity_extractor import extract_entities_batch, resolve_entities
 
@@ -209,125 +207,11 @@ async def test_llm(request: LLMTestRequest):
         raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
 
 
-@router.post("/ingest", response_model=IngestResult)
-async def ingest_directory(request: IngestRequest, background_tasks: BackgroundTasks):
-    """
-    Индексация директории с исходным кодом и документацией.
-
-    Шаг 1: Парсит C++ файлы (Tree-sitter), создаёт узлы кода и рёбра.
-    Шаг 2: Парсит .md файлы, создаёт DOCUMENT узлы.
-    Шаг 3: Автолинковка — привязывает документы к коду через DESCRIBES рёбра.
-    """
-    s = get_storage()
-    cpp_parser = CPPSymbolExtractor(request.directory)
-    md_parser = MarkdownParser(request.directory)
-
-    all_nodes = []
-    all_edges = []
-    errors = []
-    files_count = 0
-
-    # --- Шаг 1: C++ файлы ---
-    cpp_files = scan_directory(request.directory, request.extensions)
-    for file_path in cpp_files:
-        try:
-            result = cpp_parser.parse_file(file_path)
-            if result.success:
-                all_nodes.extend(result.nodes)
-                all_edges.extend(result.edges)
-            else:
-                errors.append(f"{file_path}: {result.error}")
-        except Exception as e:
-            errors.append(f"{file_path}: {str(e)}")
-    files_count += len(cpp_files)
-
-    # --- Шаг 2: Markdown файлы ---
-    md_files = scan_directory(request.directory, ['.md'])
-    md_mentions = []  # (doc_node_id, mentions) для шага 3
-    for file_path in md_files:
-        try:
-            result = md_parser.parse_file(file_path)
-            if result.success and result.node:
-                all_nodes.append(result.node)
-                md_mentions.append((result.node.node_id, result.mentions))
-            else:
-                errors.append(f"{file_path}: {result.error}")
-        except Exception as e:
-            errors.append(f"{file_path}: {str(e)}")
-    files_count += len(md_files)
-
-    if not all_nodes:
-        return IngestResult(
-            success=False, files_processed=0,
-            nodes_created=0, edges_created=0,
-            errors=[f"No files found in {request.directory}"]
-        )
-
-    # Bulk insert узлов и рёбер кода
-    s.bulk_create_nodes(all_nodes)
-    if all_edges:
-        s.bulk_create_edges(all_edges)
-
-    # --- Шаг 3: Автолинковка документов к коду ---
-    # Берём все узлы кода (не документы) из графа для матчинга
-    code_nodes = [n for n in all_nodes if n.type != "document"]
-    describe_edges = []
-    for doc_node_id, mentions in md_mentions:
-        edges = resolve_mentions_to_edges(doc_node_id, mentions, code_nodes)
-        describe_edges.extend(edges)
-
-    if describe_edges:
-        s.bulk_create_edges(describe_edges)
-        all_edges.extend(describe_edges)
-
-    return IngestResult(
-        success=len(errors) == 0,
-        files_processed=files_count,
-        nodes_created=len(all_nodes),
-        edges_created=len(all_edges),
-        errors=errors
-    )
-
-
-@router.post("/ingest/file", response_model=IngestResult)
-async def ingest_file(file_path: str):
-    """
-    Индексация одного файла.
-    """
-    s = get_storage()
-    parser = CPPSymbolExtractor(file_path)
-    
-    try:
-        result = parser.parse_file(file_path)
-        
-        if result.success:
-            if result.nodes:
-                s.bulk_create_nodes(result.nodes)
-            if result.edges:
-                s.bulk_create_edges(result.edges)
-            
-            return IngestResult(
-                success=True,
-                files_processed=1,
-                nodes_created=len(result.nodes),
-                edges_created=len(result.edges)
-            )
-        else:
-            return IngestResult(
-                success=False,
-                files_processed=0,
-                nodes_created=0,
-                edges_created=0,
-                errors=[result.error]
-            )
-    except Exception as e:
-        return IngestResult(
-            success=False,
-            files_processed=0,
-            nodes_created=0,
-            edges_created=0,
-            errors=[str(e)]
-        )
+@router.post("/ingest")
+async def ingest_directory(request: IngestRequest):
+    """Legacy endpoint — redirects to /pipeline."""
+    from fastapi.responses import RedirectResponse
+    return {"message": "Use POST /api/v1/pipeline instead", "redirect": "/api/v1/pipeline"}
 
 
 @router.get("/subgraph/{node_id}", response_model=SubgraphResponse)
@@ -511,13 +395,17 @@ class PipelineRequest(BaseModel):
 @router.post("/pipeline")
 async def auto_pipeline(request: PipelineRequest):
     """
-    Автоматический пайплайн: конвертация → индексация → эмбеддинги → summary.
+    Universal pipeline: scan → document nodes → entity extraction → embeddings.
 
-    Одна кнопка — полная обработка проекта.
-    Принимает directory ИЛИ project_name (из /upload).
+    4 clean steps. No AST parsers, no MD parsers.
+    Entity extraction is THE CORE — DeepSeek reads every document
+    and extracts entities, facts, topics, skills, preferences + edges.
     """
     from ..llm.client import get_llm_client
+    import time as _time
     import math
+
+    pipeline_start = _time.time()
 
     directory = request.directory
     project_name = request.project_name
@@ -530,97 +418,183 @@ async def auto_pipeline(request: PipelineRequest):
     vs = get_vector_store()
     client = get_llm_client()
     steps = []
-
-    # --- Step 1: Scan & Filter ---
-    scan = scan_and_filter(directory)
-    steps.append({
-        "step": "scan",
-        "status": "done",
-        "stats": scan["stats"],
-    })
-
-    # --- Step 2: Convert TXT → MD (в temp-директорию, не в исходники) ---
-    converted = []
-    if scan["txt_files"]:
-        import tempfile
-        tmp_dir = os.path.join(tempfile.gettempdir(), "graphrag_converted")
-        converted = convert_txt_files(scan["txt_files"], output_dir=tmp_dir, source_root=directory)
-        scan["doc_files"].extend(converted)
-    steps.append({
-        "step": "convert_txt",
-        "status": "done",
-        "converted": len(converted),
-    })
-
-    # --- Step 3: Ingest ---
-    # 3a: C++ через Tree-sitter (жёсткие связи AST)
-    cpp_parser = CPPSymbolExtractor(directory)
-    md_parser = MarkdownParser(directory)
-
-    all_nodes = []
-    all_edges = []
     errors = []
 
-    for fp in scan["cpp_files"]:
+    # ================================================================
+    # STEP 1: Scan & Filter — find all text files
+    # ================================================================
+    step_start = _time.time()
+    scan = scan_and_filter(directory)
+    all_files = scan["cpp_files"] + scan["doc_files"] + scan["txt_files"] + scan.get("other_text", [])
+    steps.append({
+        "step": "scan",
+        "time_s": round(_time.time() - step_start, 2),
+        "total_files": len(all_files),
+        "stats": scan["stats"],
+    })
+    logger.info(f"Step 1 (scan): {len(all_files)} files found")
+
+    # ================================================================
+    # STEP 2: Create document nodes — each file = one node with content
+    # ================================================================
+    step_start = _time.time()
+    doc_nodes = []
+
+    for fp in all_files:
         try:
-            result = cpp_parser.parse_file(fp)
-            if result.success:
-                all_nodes.extend(result.nodes)
-                all_edges.extend(result.edges)
-            else:
-                errors.append(result.error)
+            with open(fp, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            if len(content.strip()) < 10:
+                continue
+
+            # Stable node_id from file path
+            rel_path = os.path.relpath(fp, directory) if directory else fp
+            node_id = f"doc::{hashlib.sha256(rel_path.encode()).hexdigest()[:16]}"
+
+            _, ext = os.path.splitext(fp)
+            name = os.path.basename(fp)
+
+            doc_nodes.append(GraphNode(
+                node_id=node_id,
+                type="document",
+                name=name,
+                signature=rel_path,
+                file_path=rel_path,
+                line_start=0,
+                line_end=content.count('\n'),
+                source_code=content[:8000],  # Keep first 8K for entity extraction
+                summary=f"Document: {name} ({len(content)} chars)",
+                tags=[],
+            ))
         except Exception as e:
-            errors.append(str(e))
+            errors.append(f"{fp}: {e}")
 
-    # 3b: Документация (.md, .rst) через MD-парсер
-    md_mentions = []
-    for fp in scan["doc_files"]:
-        try:
-            result = md_parser.parse_file(fp)
-            if result.success and result.node:
-                all_nodes.append(result.node)
-                md_mentions.append((result.node.node_id, result.mentions))
-        except Exception as e:
-            errors.append(str(e))
-
-    # 3c: Всё остальное текстовое (.py, .json, .yaml, .log, .sql, etc.)
-    # → парсим как DOCUMENT через MD-парсер (он работает с любым текстом)
-    for fp in scan.get("other_text", []):
-        try:
-            result = md_parser.parse_file(fp)
-            if result.success and result.node:
-                all_nodes.append(result.node)
-                md_mentions.append((result.node.node_id, result.mentions))
-        except Exception as e:
-            errors.append(str(e))
-
-    if all_nodes:
-        s.bulk_create_nodes(all_nodes)
-    if all_edges:
-        s.bulk_create_edges(all_edges)
-
-    # Auto-link docs → code
-    code_nodes = [n for n in all_nodes if n.type != "document"]
-    describe_edges = []
-    for doc_id, mentions in md_mentions:
-        describe_edges.extend(resolve_mentions_to_edges(doc_id, mentions, code_nodes))
-    if describe_edges:
-        s.bulk_create_edges(describe_edges)
-        all_edges.extend(describe_edges)
+    if doc_nodes:
+        s.bulk_create_nodes(doc_nodes)
 
     steps.append({
-        "step": "ingest",
-        "status": "done",
-        "nodes": len(all_nodes),
-        "edges": len(all_edges),
+        "step": "create_documents",
+        "time_s": round(_time.time() - step_start, 2),
+        "nodes_created": len(doc_nodes),
         "errors": len(errors),
     })
+    logger.info(f"Step 2 (documents): {len(doc_nodes)} nodes created")
 
-    # --- Step 4: Embeddings ---
+    # ================================================================
+    # STEP 3: Entity Extraction — THE CORE
+    # DeepSeek reads each document → extracts entities + edges
+    # ================================================================
+    step_start = _time.time()
+    entity_nodes = []
+    entity_edges = []
+    extraction_api_calls = 0
+    extraction_tokens = {"input": 0, "output": 0}
+
+    if client.api_key and doc_nodes:
+        # Prepare items for batch extraction
+        extraction_items = []
+        for node in doc_nodes:
+            content = node.source_code or ""
+            if len(content.strip()) < 20:
+                continue
+            extraction_items.append({
+                "node_id": node.node_id,
+                "name": node.name,
+                "type": node.type,
+                "content": content,
+            })
+
+        if extraction_items:
+            batch_size = 50
+            concurrency = 10
+            logger.info(f"Step 3 (extraction): {len(extraction_items)} items, batch_size={batch_size}, concurrency={concurrency}")
+
+            raw_entities, raw_edges = await extract_entities_batch(
+                client, extraction_items, batch_size=batch_size, concurrency=concurrency
+            )
+            extraction_api_calls = math.ceil(len(extraction_items) / batch_size)
+            logger.info(
+                f"Extraction done: {len(raw_entities)} entities, {len(raw_edges)} edges"
+            )
+
+            # Entity resolution — deduplicate by normalized name
+            name_map = resolve_entities(raw_entities)
+
+            # Convert ExtractedEntity → GraphNode
+            seen_entity_ids = set()
+            for ent in raw_entities:
+                canonical = name_map.get(ent.name, ent.name)
+                ent_node_id = f"{ent.type}::{canonical}"
+
+                if ent_node_id in seen_entity_ids:
+                    continue
+                seen_entity_ids.add(ent_node_id)
+
+                entity_nodes.append(GraphNode(
+                    node_id=ent_node_id,
+                    type=ent.type,
+                    name=canonical,
+                    signature="",
+                    file_path="",
+                    line_start=0,
+                    line_end=0,
+                    source_code="",
+                    summary=ent.summary,
+                    tags=[],
+                ))
+
+            if entity_nodes:
+                s.bulk_create_nodes(entity_nodes)
+
+            # Create edges: document → entity (MENTIONS)
+            for ent in raw_entities:
+                canonical = name_map.get(ent.name, ent.name)
+                ent_node_id = f"{ent.type}::{canonical}"
+                if ent.source_node_id:
+                    entity_edges.append(GraphEdge(
+                        source_id=ent.source_node_id,
+                        target_id=ent_node_id,
+                        edge_type="MENTIONS",
+                        metadata={"confidence": ent.confidence},
+                    ))
+
+            # Create edges: entity → entity (semantic)
+            entity_by_name = {n.name: n.node_id for n in entity_nodes}
+            for ed in raw_edges:
+                src_canonical = name_map.get(ed.source_name, ed.source_name)
+                tgt_canonical = name_map.get(ed.target_name, ed.target_name)
+                src_id = entity_by_name.get(src_canonical)
+                tgt_id = entity_by_name.get(tgt_canonical)
+                if src_id and tgt_id:
+                    entity_edges.append(GraphEdge(
+                        source_id=src_id,
+                        target_id=tgt_id,
+                        edge_type=ed.edge_type,
+                        metadata={"weight": ed.weight},
+                    ))
+
+            if entity_edges:
+                s.bulk_create_edges(entity_edges)
+
+    steps.append({
+        "step": "entity_extraction",
+        "time_s": round(_time.time() - step_start, 2),
+        "entity_nodes": len(entity_nodes),
+        "entity_edges": len(entity_edges),
+        "api_calls": extraction_api_calls,
+    })
+    logger.info(f"Step 3 (extraction): {len(entity_nodes)} entities, {len(entity_edges)} edges")
+
+    # ================================================================
+    # STEP 4: Embeddings — vectorize ALL nodes (documents + entities)
+    # ================================================================
+    step_start = _time.time()
+    all_nodes = doc_nodes + entity_nodes
     emb_count = 0
+
     if all_nodes:
         texts = [
-            f"{n.type}: {n.name} - {n.summary} ({n.signature})"
+            f"{n.type}: {n.name} - {n.summary}"
             for n in all_nodes
         ]
         embeddings = await get_embeddings_batch(texts)
@@ -637,39 +611,23 @@ async def auto_pipeline(request: PipelineRequest):
                 })
         emb_count = vs.upsert_batch(items)
 
-    steps.append({"step": "embeddings", "status": "done", "indexed": emb_count})
-
-    # --- Step 5: Summaries ---
-    sum_count = 0
-    api_calls = 0
-    if client.api_key:
-        needs = [n for n in all_nodes if n.source_code
-                 and (not n.summary or n.summary.startswith(("Class ", "Function ", "Document")))]
-        if needs:
-            summaries = await client.batch_summarize(needs, batch_size=30)
-            for node in needs:
-                if node.node_id in summaries:
-                    node.summary = summaries[node.node_id]
-                    s.update_node(node)
-                    sum_count += 1
-            api_calls = math.ceil(len(needs) / 30)
-
     steps.append({
-        "step": "summaries",
-        "status": "done",
-        "updated": sum_count,
-        "api_calls": api_calls,
+        "step": "embeddings",
+        "time_s": round(_time.time() - step_start, 2),
+        "indexed": emb_count,
     })
+    logger.info(f"Step 4 (embeddings): {emb_count} vectors indexed")
 
-    total_files = len(scan["code_files"]) + len(scan["doc_files"])
+    total_time = round(_time.time() - pipeline_start, 2)
     return {
         "success": True,
         "project_dir": directory,
-        "total_files": total_files,
+        "total_time_s": total_time,
+        "total_files": len(all_files),
         "total_nodes": len(all_nodes),
-        "total_edges": len(all_edges),
+        "total_edges": len(entity_edges),
         "steps": steps,
-        "errors": errors[:10],  # Первые 10 ошибок
+        "errors": errors[:10],
     }
 
 
@@ -1054,19 +1012,21 @@ async def agent_query(request: AgentQueryRequest):
     edge_parts = []
     seen_edges = set()
     for e in context_edges:
-        key = f"{e.source_id}->{e.target_id}:{e.type}"
+        key = f"{e.source_id}->{e.target_id}:{e.edge_type}"
         if key not in seen_edges:
             seen_edges.add(key)
-            edge_parts.append(f"  {e.source_id} --[{e.type}]--> {e.target_id}")
+            edge_parts.append(f"  {e.source_id} --[{e.edge_type}]--> {e.target_id}")
 
     context_text = "\n\n".join(context_parts)
     edges_text = "\n".join(edge_parts[:50])  # Limit edges
 
     system_prompt = (
-        "You are an expert code analyst with access to a graph knowledge base. "
-        "Answer questions based ONLY on the provided context from the codebase graph. "
+        "You are a knowledge assistant with access to a universal knowledge graph. "
+        "The graph contains entities, facts, topics, skills, preferences, and documents from diverse sources "
+        "(code, literature, conversations, recipes, finance, etc). "
+        "Answer questions based ONLY on the provided context. "
+        "If context contains contradictions, explain both sides with their sources. "
         "If the context doesn't contain enough information, say so explicitly. "
-        "Always reference specific files, classes, or functions when possible. "
         "Answer in the same language as the question."
     )
 
@@ -1169,7 +1129,7 @@ async def extract_entities_from_graph():
         if canonical in entity_nodes:
             continue  # Уже создан
 
-        node_id = f"entity::{hashlib.md5(canonical.encode()).hexdigest()[:12]}"
+        node_id = f"{ent.type}::{canonical}"
         entity_nodes[canonical] = GraphNode(
             node_id=node_id,
             type=ent.type,

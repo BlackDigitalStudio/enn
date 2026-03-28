@@ -68,34 +68,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Agentic GraphRAG",
     description="""
-## Agentic GraphRAG - M2M API для LLM-агентов
+## Agentic GraphRAG - Universal Knowledge Graph
 
-Это backend-система для автономного LLM-агента, работающего с большими кодовыми базами.
+Backend for a universal knowledge graph that ingests ANY content (code, novels, recipes,
+conversations, financial data) and finds cross-context connections via entity extraction.
 
-### Ключевые концепции:
-- **Графовая навигация** вместо загрузки всего кода в контекст
-- **Context Pruning** - только метаданные при обходе графа
-- **Atomic code fetch** - полный код только когда нужно редактировать
-- **Incremental updates** - AST-парсинг только измененных файлов
+### Pipeline: scan → documents → entity extraction → embeddings
+### Query: vector search → subgraph context → LLM answer
 
-### Архитектура:
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Agent     │────▶│  GraphRAG    │────▶│   Neo4j     │
-│   (LLM)     │◀────│   API        │◀────│   Graph     │
-└─────────────┘     └─────────────┘     └─────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │  Qdrant     │
-                    │  (vector)   │
-                    └─────────────┘
-```
-
-### Использование:
-1. `POST /api/v1/ingest` - индексация кодовой базы
-2. `GET /api/v1/subgraph/{node_id}` - навигация по графу
-3. `GET /api/v1/node/{node_id}/code` - получение кода для редактирования
+### Usage:
+1. `POST /api/v1/pipeline` - ingest a directory (any content)
+2. `POST /api/v1/agent/query` - ask questions across all knowledge
+3. `GET /api/v1/subgraph/{node_id}` - navigate the graph
 """,
     version="0.1.0",
     lifespan=lifespan
@@ -193,9 +177,9 @@ async def api_spec():
             }
         },
         "models": {
-            "NodeType": ["file", "class", "function", "method", "variable", "namespace", "enum", "struct", "interface", "document", "plan"],
-            "EdgeType": ["CALLS", "INCLUDES", "IMPLEMENTS", "INHERITS", "DEPENDS_ON", "DEFINES", "HAS_METHOD", "RELATES_TO", "DESCRIBES"],
-            "TagEnum": ["core", "utility", "config", "data", "network", "parser", "storage", "api", "middleware", "handler", "abstract", "interface", "concrete", "deprecated", "entry_point", "test", "mock", "business_logic", "infrastructure", "bounded_context"]
+            "NodeType": ["document", "entity", "topic", "fact", "skill", "preference", "file", "class", "function", "method", "struct"],
+            "EdgeType": ["MENTIONS", "REVEALS", "BELONGS_TO", "RELATES_TO", "DESCRIBES", "CONTRADICTS", "SAME_AS", "SKILLED_IN", "SUPERSEDES", "CALLS", "INHERITS"],
+            "TagEnum": ["personal", "technical", "creative", "financial", "health", "social", "education", "philosophy", "entertainment", "toolchain", "core", "utility", "config", "data"]
         }
     }
 
