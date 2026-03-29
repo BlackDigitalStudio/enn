@@ -236,6 +236,15 @@ async def auto_pipeline(request: PipelineRequest):
     steps.append({"step": "scan", "time_s": round(_time.time() - step_start, 2), "files": len(all_files)})
     logger.info(f"Step 1 (scan): {len(all_files)} files")
 
+    # Seed base category nodes (roots of the tree)
+    BASE_CATEGORIES = ["персонажи", "локации", "события", "предметы", "концепции", "организации", "код"]
+    for cat in BASE_CATEGORIES:
+        s.create_node(GraphNode(
+            node_id=f"cat::{cat}", type="category", name=cat,
+            signature="", file_path="", line_start=0, line_end=0,
+            source_code="", summary=f"Базовая категория: {cat}", tags=[],
+        ))
+
     # STEP 2: Create chunks
     step_start = _time.time()
     doc_nodes = []

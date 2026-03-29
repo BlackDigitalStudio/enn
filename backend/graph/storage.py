@@ -470,10 +470,14 @@ class Neo4jStorage:
             return [dict(r) for r in result]
 
     def search_entities_by_name(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
-        """Search entities by name (case-insensitive contains)."""
+        """Search entities by name — bidirectional CONTAINS for Russian declension.
+        'кёна' finds 'кён' and vice versa.
+        """
         cypher = """
         MATCH (n:Node)
-        WHERE n.type <> 'document' AND toLower(n.name) CONTAINS toLower($search_term)
+        WHERE n.type <> 'document'
+          AND (toLower(n.name) CONTAINS toLower($search_term)
+               OR toLower($search_term) CONTAINS toLower(n.name))
         RETURN n.node_id as node_id, n.type as type, n.name as name, n.summary as summary
         ORDER BY n.name
         LIMIT $lim

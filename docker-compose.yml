@@ -34,8 +34,8 @@ services:
       - NEO4J_PASSWORD=password
       - LLM_PROVIDER=openai
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - LLM_MODEL=deepseek-chat
-      - LLM_BASE_URL=https://api.deepseek.com/v1/chat/completions
+      - LLM_MODEL=MiniMax-M1
+      - LLM_BASE_URL=https://api.minimax.io/v1/chat/completions
       - PYTHONUNBUFFERED=1
     depends_on:
       neo4j:

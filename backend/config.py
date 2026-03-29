@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     # Поддерживаемые провайдеры: "gemini", "openai", "anthropic"
     llm_provider: str = "openai"
     llm_api_key: str = ""
-    llm_model: str = "deepseek-chat"
-    llm_base_url: Optional[str] = "https://api.deepseek.com/v1/chat/completions"
+    llm_model: str = "MiniMax-M1"
+    llm_base_url: Optional[str] = "https://api.minimax.io/v1/chat/completions"
 
     # Application Settings
     app_name: str = "Tree Base"

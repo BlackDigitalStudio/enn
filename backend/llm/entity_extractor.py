@@ -47,7 +47,7 @@ def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, par
             f.write(prompt[:3000])
             if len(prompt) > 3000:
                 f.write(f"\n... [{len(prompt) - 3000} more chars]\n")
-            f.write(f"\n\n--- DEEPSEEK RESPONSE ({len(response)} chars) ---\n")
+            f.write(f"\n\n--- LLM RESPONSE ({len(response)} chars) ---\n")
             f.write(response)
             f.write(f"\n\n--- PARSED RESULT ---\n")
             if parsed:
@@ -84,6 +84,7 @@ RULES:
 - EDGE: include evidence text markers (first and last words of relevant fragment)
 - Build hierarchy: create category entities and BELONGS_TO edges
 - Summaries in the same language as content
+- Entity names: NO brackets, NO type in name. "кён" not "кён [персонаж]"
 - One entity/edge per line"""
 
 # First chunk prompt (no existing entities yet)
@@ -103,8 +104,10 @@ EDGE: source -> target | RELATIONSHIP_TYPE | evidence_starts... evidence_ends
 
 RULES:
 - Use most specific type: "character" not "entity", "ingredient" not "thing"
-- Build hierarchy: create category entities and BELONGS_TO edges
-- Entity names: lowercase, canonical
+- MANDATORY: for each entity, also output a BELONGS_TO edge to its base category. Example:
+  NEW: кён | персонаж | главный герой
+  EDGE: кён -> персонажи | BELONGS_TO |
+- Entity names: lowercase, canonical, NO brackets in names
 - Summaries in the same language as content
 - One entity/edge per line"""
 
@@ -181,7 +184,10 @@ class KnowledgeGraphState:
         updated_count = 0
 
         for ent in entities:
-            name = ent["name"].lower().strip()
+            name = ent.get("name", "").lower().strip()
+            # Remove [type] suffix from name: "кён [персонаж]" → "кён"
+            if "[" in name and name.endswith("]"):
+                name = name[:name.index("[")].strip()
             if not name:
                 continue
             conf = float(ent.get("confidence", 0.5))
@@ -470,18 +476,44 @@ def _parse_text_response(text: str) -> Optional[Dict]:
             action = "create" if line.startswith("NEW:") else "update"
             parts = line[4:].split("|")
             if len(parts) >= 3:
+                name = parts[0].strip()
+                etype = parts[1].strip()
+                summary = parts[2].strip()
+                # Validate: type should be short (category name, not a sentence)
+                if len(etype) > 30:
+                    # Type and summary probably swapped, or type is missing
+                    summary = etype + " " + summary
+                    etype = "концепция"
+                # Clean name: remove [type] suffix like "кён [персонаж]"
+                if "[" in name and name.endswith("]"):
+                    bracket = name.index("[")
+                    etype = name[bracket+1:-1].strip() or etype
+                    name = name[:bracket].strip()
                 entities.append({
-                    "name": parts[0].strip(),
-                    "type": parts[1].strip(),
-                    "summary": parts[2].strip(),
+                    "name": name.lower(),
+                    "type": etype.lower(),
+                    "summary": summary,
                     "action": action,
                     "confidence": 0.8,
                 })
             elif len(parts) >= 2:
+                name = parts[0].strip()
+                rest = parts[1].strip()
+                # If second part is long, it's summary not type
+                if len(rest) > 30:
+                    etype = "концепция"
+                    summary = rest
+                else:
+                    etype = rest
+                    summary = ""
+                if "[" in name and name.endswith("]"):
+                    bracket = name.index("[")
+                    etype = name[bracket+1:-1].strip() or etype
+                    name = name[:bracket].strip()
                 entities.append({
-                    "name": parts[0].strip(),
-                    "type": parts[1].strip(),
-                    "summary": "",
+                    "name": name.lower(),
+                    "type": etype.lower(),
+                    "summary": summary,
                     "action": action,
                     "confidence": 0.7,
                 })
