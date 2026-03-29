@@ -19,13 +19,50 @@ Processing order:
 import json
 import logging
 import asyncio
+import os
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# File logger for full extraction trace
+EXTRACTION_LOG_DIR = "/app/logs"
+
+
+def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, parsed: Any, file_name: str = ""):
+    """Write full extraction trace to log file."""
+    try:
+        os.makedirs(EXTRACTION_LOG_DIR, exist_ok=True)
+        log_file = os.path.join(EXTRACTION_LOG_DIR, f"extraction_{file_name.replace('/', '_')}.log")
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"CHUNK: {chunk_id} | TIME: {datetime.utcnow().isoformat()}\n")
+            f.write(f"{'='*80}\n")
+            f.write(f"\n--- CHUNK TEXT ({len(chunk_text)} chars) ---\n")
+            f.write(chunk_text[:2000])
+            if len(chunk_text) > 2000:
+                f.write(f"\n... [{len(chunk_text) - 2000} more chars]\n")
+            f.write(f"\n\n--- PROMPT ({len(prompt)} chars) ---\n")
+            f.write(prompt[:3000])
+            if len(prompt) > 3000:
+                f.write(f"\n... [{len(prompt) - 3000} more chars]\n")
+            f.write(f"\n\n--- DEEPSEEK RESPONSE ({len(response)} chars) ---\n")
+            f.write(response)
+            f.write(f"\n\n--- PARSED RESULT ---\n")
+            if parsed:
+                f.write(json.dumps(parsed, ensure_ascii=False, indent=2)[:3000])
+            else:
+                f.write("None (parse failed)")
+            f.write(f"\n")
+    except Exception as e:
+        logger.warning(f"Failed to write extraction log: {e}")
+
 # Context-aware extraction prompt — sees existing entities
 CONTEXT_EXTRACTION_PROMPT = """You are a knowledge graph updater. Read the new content and update the knowledge graph.
+
+BASE CATEGORIES (assign at least one to each entity, create new if needed):
+- персонаж, локация, событие, предмет, концепция, организация, код
 
 EXISTING ENTITIES IN GRAPH:
 {existing_entities}
@@ -53,7 +90,9 @@ Return ONLY valid JSON (no markdown):
       "target": "entity name",
       "type": "descriptive relationship (KNOWS, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES...)",
       "weight": 0.0-1.0,
-      "action": "create|update"
+      "action": "create|update",
+      "evidence_starts": "first few words of the relevant text fragment",
+      "evidence_ends": "last few words of the relevant text fragment"
     }}
   ]
 }}
@@ -72,6 +111,15 @@ RULES:
 
 # First chunk prompt (no existing entities yet)
 INITIAL_EXTRACTION_PROMPT = """You are a knowledge graph builder. Extract entities and relationships from this content.
+
+BASE CATEGORIES (assign at least one to each entity, create new if needed):
+- персонаж (any person, real or fictional)
+- локация (any place)
+- событие (any event or action)
+- предмет (any object, tool, ingredient)
+- концепция (any idea, theory, term)
+- организация (any group, company, faction)
+- код (any programming element)
 
 CONTENT (from {source_name}):
 {content}
@@ -94,7 +142,9 @@ Return ONLY valid JSON (no markdown):
       "source": "entity name",
       "target": "entity name",
       "type": "descriptive relationship (KNOWS, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES...)",
-      "weight": 0.0-1.0
+      "weight": 0.0-1.0,
+      "evidence_starts": "first few words of the relevant text",
+      "evidence_ends": "last few words of the relevant text"
     }}
   ]
 }}
@@ -127,6 +177,8 @@ class EdgeState:
     edge_type: str
     weight: float
     source_chunk: str = ""
+    evidence_starts: str = ""
+    evidence_ends: str = ""
 
 
 class KnowledgeGraphState:
@@ -190,6 +242,9 @@ class KnowledgeGraphState:
 
             edge_type = ed.get("type", "RELATES_TO")
 
+            evidence_starts = ed.get("evidence_starts", "")
+            evidence_ends = ed.get("evidence_ends", "")
+
             # Check if edge already exists — update type if action=update
             updated = False
             if ed.get("action") == "update":
@@ -198,6 +253,8 @@ class KnowledgeGraphState:
                         existing_edge.edge_type = edge_type
                         existing_edge.weight = w
                         existing_edge.source_chunk = chunk_id
+                        existing_edge.evidence_starts = evidence_starts
+                        existing_edge.evidence_ends = evidence_ends
                         updated = True
                         break
 
@@ -206,6 +263,8 @@ class KnowledgeGraphState:
                     source=src, target=tgt,
                     edge_type=edge_type, weight=w,
                     source_chunk=chunk_id,
+                    evidence_starts=evidence_starts,
+                    evidence_ends=evidence_ends,
                 ))
 
 
@@ -243,11 +302,12 @@ async def _extract_chunk_with_context(
                 continue
             data = _parse_json_response(response)
             if data:
-                # Handle both {"entities":...} and [{"entities":...}] formats
                 if isinstance(data, list) and len(data) > 0:
                     data = data[0]
                 if isinstance(data, dict):
+                    _log_to_file(chunk_id, content, prompt, response, data, source_name)
                     return data
+            _log_to_file(chunk_id, content, prompt, response, None, source_name)
             logger.warning(f"Unparseable response for {chunk_id} (attempt {attempt+1}): {response[:100]}")
         except Exception as e:
             logger.warning(f"Extraction error for {chunk_id} (attempt {attempt+1}): {e}")

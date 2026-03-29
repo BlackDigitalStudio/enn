@@ -43,6 +43,7 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./test_data:/app/test_data
+      - ./logs:/app/logs
       - ${DATA_DIR:-./test_data}:/app/data:ro
     deploy:
       resources:

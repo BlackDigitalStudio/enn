@@ -325,8 +325,15 @@ async def auto_pipeline(request: PipelineRequest):
             src_id = entity_node_ids.get(ed.source)
             tgt_id = entity_node_ids.get(ed.target)
             if src_id and tgt_id:
+                meta = {"weight": ed.weight}
+                if ed.evidence_starts:
+                    meta["evidence_starts"] = ed.evidence_starts
+                if ed.evidence_ends:
+                    meta["evidence_ends"] = ed.evidence_ends
+                if ed.source_chunk:
+                    meta["source_chunk"] = ed.source_chunk
                 entity_edges.append(GraphEdge(source_id=src_id, target_id=tgt_id,
-                                              edge_type=ed.edge_type, metadata={"weight": ed.weight}))
+                                              edge_type=ed.edge_type, metadata=meta))
 
         if entity_edges:
             s.bulk_create_edges(entity_edges)
@@ -359,6 +366,29 @@ Pick the most relevant nodes. Return ONLY valid JSON (no markdown):
 Select up to 5. If none relevant: {{"selected": [], "reasoning": "none relevant"}}"""
 
 
+SCRATCHPAD_PROMPT = """You are searching a knowledge graph to answer a question.
+
+QUESTION: {question}
+
+SCRATCHPAD (what you've found so far):
+{scratchpad}
+
+NEW INFORMATION:
+{new_info}
+
+Decide what to do next. Return ONLY valid JSON (no markdown):
+{{
+  "add_to_scratchpad": "summarize the useful new information in 1-3 sentences",
+  "sufficient": true/false,
+  "next_action": "explore:entity_name" or "read_chunk:chunk_id" or "answer"
+}}
+
+- "sufficient": true if you have enough to answer the question fully
+- "explore:name": follow edges of this entity to learn more
+- "read_chunk:id": load full chunk text for details
+- "answer": you have enough, generate the final answer"""
+
+
 ANSWER_PROMPT = """You are a knowledge assistant with access to a universal knowledge graph.
 The graph contains entities from diverse sources (code, literature, recipes, finance, psychology, etc).
 
@@ -367,7 +397,7 @@ If insufficient context, say so. Answer in the same language as the question.
 
 QUESTION: {question}
 
-CONTEXT:
+COLLECTED CONTEXT:
 {context}
 
 RELATIONSHIPS:
@@ -391,88 +421,119 @@ async def agent_query(request: AgentQueryRequest):
     found_entities = []
     total_nav_tokens = 0
 
-    # Step 1: Direct name search
-    words = request.question.lower().split()
-    for word in words:
-        if len(word) > 2:
-            matches = s.search_entities_by_name(word, limit=5)
-            found_entities.extend(matches)
+    # Step 1: LLM navigates root categories
+    roots = s.get_root_categories(limit=50)
+    if not roots:
+        raise HTTPException(status_code=404, detail="Knowledge graph is empty")
 
-    if found_entities:
-        seen = set()
-        unique = []
-        for r in found_entities:
-            if r["node_id"] not in seen:
-                seen.add(r["node_id"])
-                unique.append(r)
-        found_entities = unique[:10]
-        navigation_steps.append({"step": "direct_search", "found": len(found_entities)})
+    nodes_list = "\n".join([f"- {r['name']} [{r['type']}]: {r.get('summary', '')}" for r in roots])
+    nav_prompt = NAVIGATE_PROMPT.format(question=request.question, nodes_list=nodes_list)
+    nav_result = await client.generate_with_metrics(nav_prompt)
+    total_nav_tokens += nav_result.get("total_tokens", 0)
 
-    # Step 2: LLM navigation if direct search found nothing
-    if not found_entities:
-        roots = s.get_root_categories(limit=50)
-        if not roots:
-            raise HTTPException(status_code=404, detail="Knowledge graph is empty")
+    nav_data = _parse_nav(nav_result["text"])
+    navigation_steps.append({"step": "root_nav", "options": len(roots), "selected": nav_data.get("selected", [])})
 
-        nodes_list = "\n".join([f"- {r['name']} [{r['type']}]: {r.get('summary', '')}" for r in roots])
-        nav_prompt = NAVIGATE_PROMPT.format(question=request.question, nodes_list=nodes_list)
-        nav_result = await client.generate_with_metrics(nav_prompt)
-        total_nav_tokens += nav_result.get("total_tokens", 0)
+    # Step 2: Drill down into selected categories
+    for name in nav_data.get("selected", [])[:3]:
+        matches = [r for r in roots if r["name"].lower() == name.lower()]
+        if not matches:
+            matches = s.search_entities_by_name(name, limit=1)
+        if not matches:
+            continue
 
-        nav_data = _parse_nav(nav_result["text"])
-        navigation_steps.append({"step": "root_nav", "options": len(roots), "selected": nav_data.get("selected", [])})
-
-        for name in nav_data.get("selected", [])[:3]:
-            matches = [r for r in roots if r["name"].lower() == name.lower()]
-            if not matches:
-                matches = s.search_entities_by_name(name, limit=1)
-            if not matches:
-                continue
-
-            children = s.get_children(matches[0]["node_id"], limit=30)
-            if children:
-                cl = "\n".join([f"- {c['name']} [{c['type']}]: {c.get('summary', '')}" for c in children])
-                nav2 = await client.generate_with_metrics(NAVIGATE_PROMPT.format(question=request.question, nodes_list=cl))
-                total_nav_tokens += nav2.get("total_tokens", 0)
-                nav2_data = _parse_nav(nav2["text"])
-                for cn in nav2_data.get("selected", [])[:5]:
-                    cm = [c for c in children if c["name"].lower() == cn.lower()]
-                    if cm:
-                        found_entities.append(cm[0])
-            else:
-                found_entities.append(matches[0])
+        children = s.get_children(matches[0]["node_id"], limit=30)
+        if children:
+            cl = "\n".join([f"- {c['name']} [{c['type']}]: {c.get('summary', '')}" for c in children])
+            nav2 = await client.generate_with_metrics(NAVIGATE_PROMPT.format(question=request.question, nodes_list=cl))
+            total_nav_tokens += nav2.get("total_tokens", 0)
+            nav2_data = _parse_nav(nav2["text"])
+            navigation_steps.append({"step": f"drill:{name}", "options": len(children), "selected": nav2_data.get("selected", [])})
+            for cn in nav2_data.get("selected", [])[:5]:
+                cm = [c for c in children if c["name"].lower() == cn.lower()]
+                if cm:
+                    found_entities.append(cm[0])
+        else:
+            found_entities.append(matches[0])
 
     if not found_entities:
         raise HTTPException(status_code=404, detail="No relevant information found")
 
-    # Step 3: Gather context
-    context_parts = []
+    # Step 3: Scratchpad loop — iteratively gather context
+    scratchpad = ""
     edge_parts = []
+    all_sources = list(found_entities[:10])
+    max_iterations = 8
 
-    for ent in found_entities[:10]:
-        node = s.get_node(ent["node_id"])
-        if not node:
-            continue
-        info = f"[{node.type}] {node.name}"
-        if node.summary:
-            info += f": {node.summary}"
-        context_parts.append(info)
+    for iteration in range(max_iterations):
+        # Gather new info from current entities
+        new_info_parts = []
+        for ent in found_entities[:5]:
+            node = s.get_node(ent["node_id"])
+            if not node:
+                continue
+            info = f"[{node.type}] {node.name}"
+            if node.summary:
+                info += f": {node.summary}"
+            new_info_parts.append(info)
 
-        for rel in s.get_related(ent["node_id"], limit=15):
-            d = "→" if rel.get("outgoing") else "←"
-            edge_parts.append(f"  {node.name} {d}[{rel.get('edge_type', '?')}]{d} {rel['name']}")
-            if rel.get("summary"):
-                context_parts.append(f"[{rel['type']}] {rel['name']}: {rel['summary']}")
+            for rel in s.get_related(ent["node_id"], limit=15):
+                d = "→" if rel.get("outgoing") else "←"
+                edge_parts.append(f"  {node.name} {d}[{rel.get('edge_type', '?')}]{d} {rel['name']}")
+                if rel.get("summary"):
+                    new_info_parts.append(f"  [{rel['type']}] {rel['name']}: {rel['summary']}")
 
-        for chunk in s.get_chunks_for_entity(ent.get("name", ""), limit=3):
-            if chunk.get("content"):
-                context_parts.append(f"[source: {chunk.get('file_path', '?')}]\n{chunk['content']}")
+            for chunk in s.get_chunks_for_entity(ent.get("name", ""), limit=2):
+                if chunk.get("content"):
+                    new_info_parts.append(f"[source: {chunk.get('file_path', '?')}]\n{chunk['content']}")
 
-    # Step 4: LLM answers
+        new_info = "\n".join(new_info_parts)
+
+        # Ask LLM: enough or explore more?
+        sp_prompt = SCRATCHPAD_PROMPT.format(
+            question=request.question,
+            scratchpad=scratchpad or "(empty — first iteration)",
+            new_info=new_info[:4000],
+        )
+        sp_result = await client.generate_with_metrics(sp_prompt)
+        total_nav_tokens += sp_result.get("total_tokens", 0)
+        sp_data = _parse_nav(sp_result["text"])
+
+        # Update scratchpad
+        addition = sp_data.get("add_to_scratchpad", "")
+        if addition:
+            scratchpad += f"\n[iter {iteration+1}] {addition}"
+
+        navigation_steps.append({
+            "step": f"scratchpad_iter_{iteration+1}",
+            "sufficient": sp_data.get("sufficient", False),
+            "next_action": sp_data.get("next_action", "answer"),
+        })
+
+        # Check if sufficient
+        if sp_data.get("sufficient", False) or sp_data.get("next_action") == "answer":
+            break
+
+        # Follow next action
+        next_action = sp_data.get("next_action", "")
+        if next_action.startswith("explore:"):
+            entity_name = next_action[8:]
+            matches = s.search_entities_by_name(entity_name, limit=3)
+            found_entities = matches
+            all_sources.extend(matches)
+        elif next_action.startswith("read_chunk:"):
+            chunk_id = next_action[11:]
+            node = s.get_node(chunk_id)
+            if node and node.source_code:
+                scratchpad += f"\n[chunk {chunk_id}] {node.source_code[:2000]}"
+        else:
+            break
+
+    # Step 4: Final answer from scratchpad
     answer_prompt = ANSWER_PROMPT.format(
         question=request.question,
-        context="\n\n".join(context_parts),
-        edges="\n".join(edge_parts[:30]),
+        context=scratchpad,
+        edges="\n".join(list(set(edge_parts))[:30]),
     )
     result = await client.generate_with_metrics(answer_prompt)
 
@@ -486,10 +547,11 @@ async def agent_query(request: AgentQueryRequest):
             "output_tokens": result["output_tokens"],
             "total_tokens": result["total_tokens"] + total_nav_tokens,
             "nav_tokens": total_nav_tokens,
-            "context_entities": len(found_entities),
+            "scratchpad_iterations": len([s for s in navigation_steps if "scratchpad" in s.get("step", "")]),
+            "context_entities": len(all_sources),
         },
         "navigation": navigation_steps,
-        "sources": [{"node_id": e["node_id"], "type": e["type"], "name": e["name"]} for e in found_entities[:10]],
+        "sources": [{"node_id": e["node_id"], "type": e["type"], "name": e["name"]} for e in all_sources[:10]],
     }
 
 
