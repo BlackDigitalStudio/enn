@@ -518,10 +518,13 @@ async def agent_query(request: AgentQueryRequest):
     max_iterations = 8
 
     for iteration in range(max_iterations):
-        # Gather new info from current entities
+        # Gather new info from current entities (batch fetch to avoid N+1)
         new_info_parts = []
+        ent_ids = [e["node_id"] for e in found_entities[:5]]
+        batch_nodes = {n.node_id: n for n in s.get_nodes_bulk(ent_ids)}
+
         for ent in found_entities[:5]:
-            node = s.get_node(ent["node_id"])
+            node = batch_nodes.get(ent["node_id"])
             if not node:
                 continue
             info = f"[{node.type}] {node.name}"
@@ -574,6 +577,16 @@ async def agent_query(request: AgentQueryRequest):
         addition = sp_data.get("add_to_scratchpad", "")
         if addition:
             scratchpad += f"\n[iter {iteration+1}] {addition}"
+
+        # Compress scratchpad only when it fills 80% of context window
+        # MiniMax M2.7: 205K tokens ≈ ~600K chars. 80% = ~480K chars.
+        CONTEXT_LIMIT_CHARS = 480000
+        if len(scratchpad) > CONTEXT_LIMIT_CHARS:
+            compress_prompt = f"Compress this scratchpad to key facts only, keep all entity names and relationships:\n\n{scratchpad}"
+            compress_result = await client.generate_with_metrics(compress_prompt)
+            total_nav_tokens += compress_result.get("total_tokens", 0)
+            scratchpad = f"[compressed]\n{compress_result['text']}"
+            navigation_steps.append({"step": "scratchpad_compressed", "old_len": len(scratchpad)})
 
         navigation_steps.append({
             "step": f"scratchpad_iter_{iteration+1}",

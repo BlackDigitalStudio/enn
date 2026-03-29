@@ -335,31 +335,57 @@ class Neo4jStorage:
         edge_types: List[str] = None,
         include_code: bool = False
     ) -> Optional[SubgraphResult]:
+        """Single-query subgraph fetch — center node + neighbors in one round-trip."""
+        max_depth = min(depth, 3)
+        type_filter = ""
+        params: Dict[str, Any] = {"node_id": node_id}
+        if edge_types:
+            type_filter = "WHERE ALL(r IN relationships(path) WHERE r.type IN $edge_types)"
+            params["edge_types"] = edge_types
+
+        cypher = f"""
+        MATCH (center:Node {{node_id: $node_id}})
+        OPTIONAL MATCH path = (center)-[*1..{max_depth}]-(end:Node)
+        {type_filter}
+        WITH center,
+             collect(nodes(path)) AS all_path_nodes,
+             collect(relationships(path)) AS all_path_edges
+        WITH center,
+             reduce(acc = [], ns IN all_path_nodes | acc + ns) AS flat_nodes,
+             reduce(acc = [], es IN all_path_edges | acc + es) AS flat_edges
+        WITH center, flat_nodes, flat_edges
+        UNWIND (CASE WHEN size(flat_nodes) > 0 THEN flat_nodes ELSE [center] END) AS n
+        WITH center, collect(DISTINCT n) AS unique_nodes, flat_edges
+        UNWIND (CASE WHEN size(flat_edges) > 0 THEN flat_edges ELSE [null] END) AS e
+        WITH center, unique_nodes, collect(DISTINCT e) AS raw_edges
+        RETURN center, unique_nodes, [e IN raw_edges WHERE e IS NOT NULL] AS unique_edges
         """
-        Получение подграфа с Context Pruning.
-        
-        Это основной API эндпоинт для навигации агента.
-        Возвращает метаданные без source_code по умолчанию.
-        """
-        center_node = self.get_node(node_id)
-        if not center_node:
-            return None
-        
-        nodes, edges = self.get_neighbors(node_id, depth, edge_types)
-        
-        # Добавляем центральный узел если его нет в соседях
-        node_ids = {n.node_id for n in nodes}
-        if center_node.node_id not in node_ids:
-            nodes.insert(0, center_node)
-        
-        return SubgraphResult(
-            center_node=center_node,
-            nodes=nodes,
-            edges=edges,
-            depth=depth,
-            total_nodes=len(nodes),
-            total_edges=len(edges)
-        )
+
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, **params)
+            record = result.single()
+            if not record or not record["center"]:
+                return None
+
+            center_node = GraphNode.from_dict(dict(record["center"]))
+            nodes = [GraphNode.from_dict(dict(n)) for n in record["unique_nodes"]]
+            edges = []
+            for rel in record["unique_edges"]:
+                edge = GraphEdge(
+                    source_id=dict(rel.start_node)["node_id"],
+                    target_id=dict(rel.end_node)["node_id"],
+                    edge_type=rel.get("type", "RELATES_TO"),
+                    metadata=json.loads(rel.get("metadata", "{}")) if rel.get("metadata") else {}
+                )
+                edges.append(edge)
+
+            if center_node.node_id not in {n.node_id for n in nodes}:
+                nodes.insert(0, center_node)
+
+            return SubgraphResult(
+                center_node=center_node, nodes=nodes, edges=edges,
+                depth=depth, total_nodes=len(nodes), total_edges=len(edges)
+            )
     
     # ============== Search ==============
     
