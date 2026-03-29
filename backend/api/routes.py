@@ -345,7 +345,7 @@ async def auto_pipeline(request: PipelineRequest):
     total_time = round(_time.time() - pipeline_start, 2)
     return {
         "success": True, "project_dir": directory, "total_time_s": total_time,
-        "total_files": len(all_files), "total_nodes": len(all_nodes),
+        "total_files": len(all_files), "total_nodes": len(doc_nodes) + len(entity_nodes),
         "total_edges": len(entity_edges) + len(chunk_edges), "steps": steps,
         "errors": errors[:10],
     }
