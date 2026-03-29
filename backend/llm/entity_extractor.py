@@ -329,6 +329,7 @@ async def extract_file_sequential(
                 f"entities: {ent_names} | edges: {edge_types} | "
                 f"total: {len(state.entities)} entities, {len(state.edges)} edges"
             )
+        else:
             failed_chunks.append(i)
             logger.warning(f"  [{i+1}/{len(chunks)}] no data returned (will retry)")
 
