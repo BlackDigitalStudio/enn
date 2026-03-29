@@ -469,6 +469,39 @@ class Neo4jStorage:
             result = session.run(cypher, name=entity_name, limit=limit)
             return [dict(r) for r in result]
 
+    def get_evidence_for_entity(self, entity_name: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get evidence fragments from edges connected to an entity.
+        Returns edge metadata with evidence_starts/evidence_ends + source chunk for extraction.
+        """
+        cypher = """
+        MATCH (a:Node)-[e:EDGE]-(b:Node)
+        WHERE (a.name = $name OR b.name = $name) AND e.metadata IS NOT NULL
+        RETURN a.name as source, b.name as target, e.type as edge_type,
+               e.metadata as metadata
+        LIMIT $lim
+        """
+        with self._driver.session(database=self.database) as session:
+            result = session.run(cypher, name=entity_name, lim=limit)
+            evidences = []
+            for r in result:
+                meta = r.get("metadata", "{}")
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except:
+                        meta = {}
+                ev_starts = meta.get("evidence_starts", "")
+                ev_ends = meta.get("evidence_ends", "")
+                chunk_id = meta.get("source_chunk", "")
+                if ev_starts or ev_ends:
+                    evidences.append({
+                        "source": r["source"], "target": r["target"],
+                        "edge_type": r["edge_type"],
+                        "evidence_starts": ev_starts, "evidence_ends": ev_ends,
+                        "source_chunk": chunk_id,
+                    })
+            return evidences
+
     def search_entities_by_name(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Search entities by name — bidirectional CONTAINS for Russian declension.
         'кёна' finds 'кён' and vice versa.

@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     # Поддерживаемые провайдеры: "gemini", "openai", "anthropic"
     llm_provider: str = "openai"
     llm_api_key: str = ""
-    llm_model: str = "MiniMax-M2.7"
+    llm_model: str = "MiniMax-M2.7-highspeed"
     llm_base_url: Optional[str] = "https://api.minimax.io/v1/chat/completions"
 
     # Application Settings

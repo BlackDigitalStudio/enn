@@ -249,7 +249,7 @@ async def auto_pipeline(request: PipelineRequest):
     step_start = _time.time()
     doc_nodes = []
     chunk_edges = []
-    CHUNK_SIZE = 8000
+    CHUNK_SIZE = 12000
 
     for fp in all_files:
         try:
@@ -532,9 +532,28 @@ async def agent_query(request: AgentQueryRequest):
                 if rel.get("summary"):
                     new_info_parts.append(f"  [{rel['type']}] {rel['name']}: {rel['summary']}")
 
-            for chunk in s.get_chunks_for_entity(ent.get("name", ""), limit=2):
-                if chunk.get("content"):
-                    new_info_parts.append(f"[source: {chunk.get('file_path', '?')}]\n{chunk['content']}")
+            # Read evidence fragments first (cheap), full chunks as fallback
+            evidences = s.get_evidence_for_entity(ent.get("name", ""), limit=5)
+            if evidences:
+                for ev in evidences:
+                    ev_text = f"  [{ev['edge_type']}] {ev['source']} → {ev['target']}"
+                    if ev.get("evidence_starts"):
+                        # Extract text between markers from source chunk
+                        chunk_id = ev.get("source_chunk", "")
+                        if chunk_id:
+                            chunk_node = s.get_node(chunk_id)
+                            if chunk_node and chunk_node.source_code:
+                                src = chunk_node.source_code
+                                start_idx = src.find(ev["evidence_starts"])
+                                end_idx = src.find(ev["evidence_ends"], max(0, start_idx)) + len(ev["evidence_ends"]) if ev.get("evidence_ends") else -1
+                                if start_idx >= 0 and end_idx > start_idx:
+                                    ev_text += f": {src[start_idx:end_idx]}"
+                    new_info_parts.append(ev_text)
+            else:
+                # Fallback: read full chunks
+                for chunk in s.get_chunks_for_entity(ent.get("name", ""), limit=2):
+                    if chunk.get("content"):
+                        new_info_parts.append(f"[source: {chunk.get('file_path', '?')}]\n{chunk['content']}")
 
         new_info = "\n".join(new_info_parts)
 
@@ -595,6 +614,26 @@ async def agent_query(request: AgentQueryRequest):
         edges="\n".join(list(set(edge_parts))[:30]),
     )
     result = await client.generate_with_metrics(answer_prompt)
+
+    # Cache answer in graph — next identical query finds it via auto-search
+    try:
+        answer_hash = hashlib.sha256(request.question.encode()).hexdigest()[:12]
+        cache_node = GraphNode(
+            node_id=f"answer::{answer_hash}", type="cached_answer",
+            name=request.question[:100].lower(), signature=request.question,
+            file_path="", line_start=0, line_end=0,
+            source_code=result["text"][:2000], summary=result["text"][:200],
+            tags=[],
+        )
+        s.create_node(cache_node)
+        # Link to source entities
+        for ent in all_sources[:5]:
+            s.create_edge(GraphEdge(
+                source_id=f"answer::{answer_hash}", target_id=ent["node_id"],
+                edge_type="ANSWERED_FROM",
+            ))
+    except Exception as e:
+        logger.warning(f"Failed to cache answer: {e}")
 
     return {
         "question": request.question,

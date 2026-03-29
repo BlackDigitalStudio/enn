@@ -34,7 +34,7 @@ services:
       - NEO4J_PASSWORD=password
       - LLM_PROVIDER=openai
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - LLM_MODEL=MiniMax-M2.7
+      - LLM_MODEL=MiniMax-M2.7-highspeed
       - LLM_BASE_URL=https://api.minimax.io/v1/chat/completions
       - PYTHONUNBUFFERED=1
     depends_on:

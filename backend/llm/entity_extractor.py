@@ -71,21 +71,37 @@ CONTENT (from {source_name}):
 
 ---
 
-Return ONLY lines in this exact format (no JSON, no markdown, no commentary):
+Return ONLY valid JSON (no markdown):
 
-NEW: name | type | summary in content language
-UPD: name | type | updated summary
-EDGE: source -> target | RELATIONSHIP_TYPE | evidence_starts... evidence_ends
+{{
+  "entities": [
+    {{
+      "name": "canonical name (lowercase, no brackets, reuse existing names)",
+      "type": "base category or specific type",
+      "summary": "description in content language",
+      "action": "create|update"
+    }}
+  ],
+  "edges": [
+    {{
+      "source": "entity name",
+      "target": "entity name",
+      "type": "RELATIONSHIP_TYPE",
+      "evidence_starts": "first few words of relevant text",
+      "evidence_ends": "last few words of relevant text",
+      "action": "create|update"
+    }}
+  ]
+}}
 
 RULES:
 - REUSE existing entity names and types
-- UPD if entity exists and you learn something new
-- NEW only for genuinely new entities
-- EDGE: include evidence text markers (first and last words of relevant fragment)
-- Build hierarchy: create category entities and BELONGS_TO edges
+- action="update" if entity exists and you learn something new
+- action="create" only for genuinely new entities
+- MANDATORY: for each new entity, add BELONGS_TO edge to its base category
+- Evidence: first and last words of the text fragment that supports this edge
 - Summaries in the same language as content
-- Entity names: NO brackets, NO type in name. "кён" not "кён [персонаж]"
-- One entity/edge per line"""
+- Entity names: lowercase, no brackets"""
 
 # First chunk prompt (no existing entities yet)
 INITIAL_EXTRACTION_PROMPT = """You are a knowledge graph builder. Extract entities and relationships from this content.
@@ -97,19 +113,33 @@ CONTENT (from {source_name}):
 
 ---
 
-Return ONLY lines in this exact format (no JSON, no markdown, no commentary):
+Return ONLY valid JSON (no markdown):
 
-NEW: name | type | summary in content language
-EDGE: source -> target | RELATIONSHIP_TYPE | evidence_starts... evidence_ends
+{{
+  "entities": [
+    {{
+      "name": "canonical name (lowercase, no brackets)",
+      "type": "base category or specific type",
+      "summary": "description in content language"
+    }}
+  ],
+  "edges": [
+    {{
+      "source": "entity name",
+      "target": "entity name",
+      "type": "RELATIONSHIP_TYPE",
+      "evidence_starts": "first few words of relevant text",
+      "evidence_ends": "last few words of relevant text"
+    }}
+  ]
+}}
 
 RULES:
-- Use most specific type: "character" not "entity", "ingredient" not "thing"
-- MANDATORY: for each entity, also output a BELONGS_TO edge to its base category. Example:
-  NEW: кён | персонаж | главный герой
-  EDGE: кён -> персонажи | BELONGS_TO |
-- Entity names: lowercase, canonical, NO brackets in names
-- Summaries in the same language as content
-- One entity/edge per line"""
+- Use most specific type from base categories or create your own
+- MANDATORY: for each entity, add BELONGS_TO edge to its base category
+- Evidence: first and last words of the text fragment that supports this edge
+- Entity names: lowercase, no brackets
+- Summaries in the same language as content"""
 
 
 @dataclass
@@ -285,7 +315,7 @@ async def _extract_chunk_with_context(
                 if attempt < max_retries:
                     await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1, 2, 4 sec
                 continue
-            data = _parse_text_response(response)
+            data = _parse_response(response)
             _log_to_file(chunk_id, content, prompt, response, data, source_name)
             if data and (data.get("entities") or data.get("edges")):
                 return data
@@ -444,121 +474,37 @@ def merge_file_states(
     return global_state
 
 
-def _parse_text_response(text: str) -> Optional[Dict]:
-    """Parse text-format extraction response.
-
-    Format:
-    NEW: name | type | summary
-    UPD: name | type | updated summary
-    EDGE: source -> target | RELATIONSHIP | evidence_starts... evidence_ends
-
-    Resilient to truncation — each line is independent.
-    Also handles JSON fallback if LLM ignores text format instruction.
+def _parse_response(text: str) -> Optional[Dict]:
+    """Parse extraction response — JSON primary, text fallback.
+    With 131K max output from MiniMax, JSON won't truncate.
     """
     text = text.strip()
 
-    # Remove markdown code blocks if present
+    # Remove markdown code blocks
     if text.startswith("```"):
         lines = text.split("\n")
         lines = [l for l in lines if not l.startswith("```")]
         text = "\n".join(lines).strip()
 
-    entities = []
-    edges = []
-
-    # Try text format first
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-
-        if line.startswith(("NEW:", "UPD:")):
-            action = "create" if line.startswith("NEW:") else "update"
-            parts = line[4:].split("|")
-            if len(parts) >= 3:
-                name = parts[0].strip()
-                etype = parts[1].strip()
-                summary = parts[2].strip()
-                # Validate: type should be short (category name, not a sentence)
-                if len(etype) > 30:
-                    # Type and summary probably swapped, or type is missing
-                    summary = etype + " " + summary
-                    etype = "концепция"
-                # Clean name: remove [type] suffix like "кён [персонаж]"
-                if "[" in name and name.endswith("]"):
-                    bracket = name.index("[")
-                    etype = name[bracket+1:-1].strip() or etype
-                    name = name[:bracket].strip()
-                entities.append({
-                    "name": name.lower(),
-                    "type": etype.lower(),
-                    "summary": summary,
-                    "action": action,
-                    "confidence": 0.8,
-                })
-            elif len(parts) >= 2:
-                name = parts[0].strip()
-                rest = parts[1].strip()
-                # If second part is long, it's summary not type
-                if len(rest) > 30:
-                    etype = "концепция"
-                    summary = rest
-                else:
-                    etype = rest
-                    summary = ""
-                if "[" in name and name.endswith("]"):
-                    bracket = name.index("[")
-                    etype = name[bracket+1:-1].strip() or etype
-                    name = name[:bracket].strip()
-                entities.append({
-                    "name": name.lower(),
-                    "type": etype.lower(),
-                    "summary": summary,
-                    "action": action,
-                    "confidence": 0.7,
-                })
-
-        elif line.startswith("EDGE:"):
-            rest = line[5:].strip()
-            # Parse: source -> target | TYPE | evidence
-            arrow_idx = rest.find("->")
-            if arrow_idx < 0:
-                continue
-            source = rest[:arrow_idx].strip()
-            after_arrow = rest[arrow_idx + 2:]
-            parts = after_arrow.split("|")
-            if len(parts) >= 2:
-                target = parts[0].strip()
-                edge_type = parts[1].strip()
-                evidence_starts = ""
-                evidence_ends = ""
-                if len(parts) >= 3:
-                    evidence = parts[2].strip()
-                    if "..." in evidence:
-                        ev_parts = evidence.split("...")
-                        evidence_starts = ev_parts[0].strip()
-                        evidence_ends = ev_parts[-1].strip()
-                edges.append({
-                    "source": source,
-                    "target": target,
-                    "type": edge_type,
-                    "weight": 0.8,
-                    "evidence_starts": evidence_starts,
-                    "evidence_ends": evidence_ends,
-                })
-
-    # If text parsing found something, return it
-    if entities or edges:
-        return {"entities": entities, "edges": edges}
-
-    # Fallback: try JSON parsing (LLM might ignore text format instruction)
+    # Try JSON first
     try:
-        # Try to find JSON object
         json_start = text.find("{")
         json_end = text.rfind("}")
         if json_start >= 0 and json_end > json_start:
             data = json.loads(text[json_start:json_end + 1])
             if isinstance(data, dict):
+                # Clean entity names: remove [brackets]
+                for ent in data.get("entities", []):
+                    name = ent.get("name", "")
+                    if "[" in name and name.endswith("]"):
+                        bracket = name.index("[")
+                        ent["name"] = name[:bracket].strip()
+                    ent["name"] = ent.get("name", "").lower().strip()
+                    # Validate type
+                    etype = ent.get("type", "")
+                    if len(etype) > 30:
+                        ent["summary"] = etype + " " + ent.get("summary", "")
+                        ent["type"] = "концепция"
                 return data
     except json.JSONDecodeError:
         pass
@@ -569,10 +515,39 @@ def _parse_text_response(text: str) -> Optional[Dict]:
         json_end = text.rfind("]")
         if json_start >= 0 and json_end > json_start:
             data = json.loads(text[json_start:json_end + 1])
-            if isinstance(data, list) and data:
-                return data[0] if isinstance(data[0], dict) else None
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                return data[0]
     except json.JSONDecodeError:
         pass
+
+    # Text fallback: parse NEW:/UPD:/EDGE: lines
+    entities = []
+    edges = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith(("NEW:", "UPD:")):
+            action = "create" if line.startswith("NEW:") else "update"
+            parts = line[4:].split("|")
+            if len(parts) >= 2:
+                name = parts[0].strip().lower()
+                if "[" in name and name.endswith("]"):
+                    name = name[:name.index("[")].strip()
+                etype = parts[1].strip().lower() if len(parts[1].strip()) <= 30 else "концепция"
+                summary = parts[2].strip() if len(parts) >= 3 else ""
+                entities.append({"name": name, "type": etype, "summary": summary, "action": action, "confidence": 0.8})
+        elif line.startswith("EDGE:"):
+            rest = line[5:].strip()
+            arrow = rest.find("->")
+            if arrow >= 0:
+                source = rest[:arrow].strip().lower()
+                after = rest[arrow+2:].split("|")
+                if len(after) >= 2:
+                    edges.append({"source": source, "target": after[0].strip().lower(),
+                                  "type": after[1].strip(), "weight": 0.8,
+                                  "evidence_starts": "", "evidence_ends": ""})
+
+    if entities or edges:
+        return {"entities": entities, "edges": edges}
 
     logger.warning(f"Failed to parse response: {text[:200]}")
     return None
