@@ -177,7 +177,7 @@ class LLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        payload = {"model": self.model, "messages": messages}
+        payload = {"model": self.model, "messages": messages, "max_tokens": 8192}
         headers = {"Authorization": f"Bearer {self.api_key}"}
 
         session = await self._get_session()

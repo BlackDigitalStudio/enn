@@ -422,40 +422,79 @@ async def agent_query(request: AgentQueryRequest):
     found_entities = []
     total_nav_tokens = 0
 
-    # Step 1: LLM navigates root categories
-    roots = s.get_root_categories(limit=50)
-    if not roots:
-        raise HTTPException(status_code=404, detail="Knowledge graph is empty")
+    # Step 0: Auto-search — every word from question searched in entity names
+    STOP_WORDS = {"кто", "что", "как", "где", "когда", "почему", "какой", "какая", "какие",
+                  "это", "ли", "не", "да", "нет", "все", "весь", "был", "быть", "есть",
+                  "the", "is", "are", "was", "were", "who", "what", "how", "where", "when",
+                  "why", "which", "do", "does", "did", "will", "can", "has", "have", "had",
+                  "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "from"}
 
-    nodes_list = "\n".join([f"- {r['name']} [{r['type']}]: {r.get('summary', '')}" for r in roots])
-    nav_prompt = NAVIGATE_PROMPT.format(question=request.question, nodes_list=nodes_list)
-    nav_result = await client.generate_with_metrics(nav_prompt)
-    total_nav_tokens += nav_result.get("total_tokens", 0)
+    words = [w for w in request.question.lower().split() if len(w) > 2 and w not in STOP_WORDS]
+    auto_results = []
+    for word in words:
+        matches = s.search_entities_by_name(word, limit=5)
+        auto_results.extend(matches)
 
-    nav_data = _parse_nav(nav_result["text"])
-    navigation_steps.append({"step": "root_nav", "options": len(roots), "selected": nav_data.get("selected", [])})
+    if auto_results:
+        # Deduplicate and rank: exact match > substring
+        seen = {}
+        for r in auto_results:
+            nid = r["node_id"]
+            if nid not in seen:
+                # Score: exact match = 2, substring = 1
+                name_lower = r["name"].lower()
+                score = 2 if any(w == name_lower for w in words) else 1
+                seen[nid] = {**r, "_score": score}
+            else:
+                # Boost if matched multiple words
+                seen[nid]["_score"] = seen[nid].get("_score", 1) + 1
 
-    # Step 2: Drill down into selected categories
-    for name in nav_data.get("selected", [])[:3]:
-        matches = [r for r in roots if r["name"].lower() == name.lower()]
-        if not matches:
-            matches = s.search_entities_by_name(name, limit=1)
-        if not matches:
-            continue
+        ranked = sorted(seen.values(), key=lambda x: -x.get("_score", 0))
+        found_entities = ranked[:10]
 
-        children = s.get_children(matches[0]["node_id"], limit=30)
-        if children:
-            cl = "\n".join([f"- {c['name']} [{c['type']}]: {c.get('summary', '')}" for c in children])
-            nav2 = await client.generate_with_metrics(NAVIGATE_PROMPT.format(question=request.question, nodes_list=cl))
-            total_nav_tokens += nav2.get("total_tokens", 0)
-            nav2_data = _parse_nav(nav2["text"])
-            navigation_steps.append({"step": f"drill:{name}", "options": len(children), "selected": nav2_data.get("selected", [])})
-            for cn in nav2_data.get("selected", [])[:5]:
-                cm = [c for c in children if c["name"].lower() == cn.lower()]
-                if cm:
-                    found_entities.append(cm[0])
-        else:
-            found_entities.append(matches[0])
+        # Pass to LLM with summaries and paths
+        auto_info = "\n".join([f"- {e['name']} [{e['type']}]: {e.get('summary', '')}" for e in found_entities])
+        navigation_steps.append({
+            "step": "auto_search",
+            "found": len(found_entities),
+            "words_searched": words,
+            "results": [e["name"] for e in found_entities[:5]],
+        })
+
+    # Step 1: LLM navigates root categories (only if auto-search found nothing)
+    if not found_entities:
+        roots = s.get_root_categories(limit=50)
+        if not roots:
+            raise HTTPException(status_code=404, detail="Knowledge graph is empty")
+
+        nodes_list = "\n".join([f"- {r['name']} [{r['type']}]: {r.get('summary', '')}" for r in roots])
+        nav_prompt = NAVIGATE_PROMPT.format(question=request.question, nodes_list=nodes_list)
+        nav_result = await client.generate_with_metrics(nav_prompt)
+        total_nav_tokens += nav_result.get("total_tokens", 0)
+
+        nav_data = _parse_nav(nav_result["text"])
+        navigation_steps.append({"step": "root_nav", "options": len(roots), "selected": nav_data.get("selected", [])})
+
+        for name in nav_data.get("selected", [])[:3]:
+            matches = [r for r in roots if r["name"].lower() == name.lower()]
+            if not matches:
+                matches = s.search_entities_by_name(name, limit=1)
+            if not matches:
+                continue
+
+            children = s.get_children(matches[0]["node_id"], limit=30)
+            if children:
+                cl = "\n".join([f"- {c['name']} [{c['type']}]: {c.get('summary', '')}" for c in children])
+                nav2 = await client.generate_with_metrics(NAVIGATE_PROMPT.format(question=request.question, nodes_list=cl))
+                total_nav_tokens += nav2.get("total_tokens", 0)
+                nav2_data = _parse_nav(nav2["text"])
+                navigation_steps.append({"step": f"drill:{name}", "options": len(children), "selected": nav2_data.get("selected", [])})
+                for cn in nav2_data.get("selected", [])[:5]:
+                    cm = [c for c in children if c["name"].lower() == cn.lower()]
+                    if cm:
+                        found_entities.append(cm[0])
+            else:
+                found_entities.append(matches[0])
 
     if not found_entities:
         raise HTTPException(status_code=404, detail="No relevant information found")

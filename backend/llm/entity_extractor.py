@@ -61,102 +61,52 @@ def _log_to_file(chunk_id: str, chunk_text: str, prompt: str, response: str, par
 # Context-aware extraction prompt — sees existing entities
 CONTEXT_EXTRACTION_PROMPT = """You are a knowledge graph updater. Read the new content and update the knowledge graph.
 
-BASE CATEGORIES (assign at least one to each entity, create new if needed):
-- персонаж, локация, событие, предмет, концепция, организация, код
+BASE CATEGORIES: персонаж, локация, событие, предмет, концепция, организация, код
 
-EXISTING ENTITIES IN GRAPH:
+EXISTING ENTITIES:
 {existing_entities}
-
-NEW CONTENT (from {source_name}):
-{content}
-
----
-
-Return ONLY valid JSON (no markdown):
-
-{{
-  "entities": [
-    {{
-      "name": "canonical name (lowercase, reuse existing names when possible)",
-      "type": "most specific type (character, location, ability, ingredient, class, concept...)",
-      "summary": "updated description incorporating new info (same language as content)",
-      "action": "create|update",
-      "confidence": 0.0-1.0
-    }}
-  ],
-  "edges": [
-    {{
-      "source": "entity name",
-      "target": "entity name",
-      "type": "descriptive relationship (KNOWS, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES...)",
-      "weight": 0.0-1.0,
-      "action": "create|update",
-      "evidence_starts": "first few words of the relevant text fragment",
-      "evidence_ends": "last few words of the relevant text fragment"
-    }}
-  ]
-}}
-
-RULES:
-- REUSE existing entity names — do NOT create "меркурий" if "меркурий" already exists
-- REUSE existing types — if "меркурий" is already "character", keep it "character"
-- UPDATE summaries — if you learn something new about an existing entity, set action="update"
-- UPDATE edges — if a relationship changed (enemies became friends), set action="update" with new type
-- CREATE only genuinely new entities not in the existing list
-- BUILD HIERARCHY: create category nodes (e.g. "персонажи", "локации") and connect entities via BELONGS_TO edges
-- Summaries in the same language as source content
-- Extract ALL meaningful entities and edges (no artificial limit)
-- Skip confidence < 0.3
-"""
-
-# First chunk prompt (no existing entities yet)
-INITIAL_EXTRACTION_PROMPT = """You are a knowledge graph builder. Extract entities and relationships from this content.
-
-BASE CATEGORIES (assign at least one to each entity, create new if needed):
-- персонаж (any person, real or fictional)
-- локация (any place)
-- событие (any event or action)
-- предмет (any object, tool, ingredient)
-- концепция (any idea, theory, term)
-- организация (any group, company, faction)
-- код (any programming element)
 
 CONTENT (from {source_name}):
 {content}
 
 ---
 
-Return ONLY valid JSON (no markdown):
+Return ONLY lines in this exact format (no JSON, no markdown, no commentary):
 
-{{
-  "entities": [
-    {{
-      "name": "canonical name (lowercase)",
-      "type": "most specific type (character, location, ability, ingredient, class, concept...)",
-      "summary": "one-line description (same language as content)",
-      "confidence": 0.0-1.0
-    }}
-  ],
-  "edges": [
-    {{
-      "source": "entity name",
-      "target": "entity name",
-      "type": "descriptive relationship (KNOWS, LOCATED_IN, PART_OF, FIGHTS, LOVES, CREATES...)",
-      "weight": 0.0-1.0,
-      "evidence_starts": "first few words of the relevant text",
-      "evidence_ends": "last few words of the relevant text"
-    }}
-  ]
-}}
+NEW: name | type | summary in content language
+UPD: name | type | updated summary
+EDGE: source -> target | RELATIONSHIP_TYPE | evidence_starts... evidence_ends
+
+RULES:
+- REUSE existing entity names and types
+- UPD if entity exists and you learn something new
+- NEW only for genuinely new entities
+- EDGE: include evidence text markers (first and last words of relevant fragment)
+- Build hierarchy: create category entities and BELONGS_TO edges
+- Summaries in the same language as content
+- One entity/edge per line"""
+
+# First chunk prompt (no existing entities yet)
+INITIAL_EXTRACTION_PROMPT = """You are a knowledge graph builder. Extract entities and relationships from this content.
+
+BASE CATEGORIES: персонаж, локация, событие, предмет, концепция, организация, код
+
+CONTENT (from {source_name}):
+{content}
+
+---
+
+Return ONLY lines in this exact format (no JSON, no markdown, no commentary):
+
+NEW: name | type | summary in content language
+EDGE: source -> target | RELATIONSHIP_TYPE | evidence_starts... evidence_ends
 
 RULES:
 - Use most specific type: "character" not "entity", "ingredient" not "thing"
-- BUILD HIERARCHY: create category nodes (e.g. "персонажи", "локации") and connect entities via BELONGS_TO edges
+- Build hierarchy: create category entities and BELONGS_TO edges
 - Entity names: lowercase, canonical
-- Summaries in the same language as source content
-- Maximum 15 entities + 20 edges
-- Skip confidence < 0.3
-"""
+- Summaries in the same language as content
+- One entity/edge per line"""
 
 
 @dataclass
@@ -303,7 +253,7 @@ async def _extract_chunk_with_context(
     source_name: str,
     chunk_id: str,
     graph_state: KnowledgeGraphState,
-    max_retries: int = 2,
+    max_retries: int = 4,
 ) -> Optional[Dict]:
     """Extract entities from one chunk, with context of existing graph state."""
 
@@ -329,15 +279,12 @@ async def _extract_chunk_with_context(
                 if attempt < max_retries:
                     await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1, 2, 4 sec
                 continue
-            data = _parse_json_response(response)
-            if data:
-                if isinstance(data, list) and len(data) > 0:
-                    data = data[0]
-                if isinstance(data, dict):
-                    _log_to_file(chunk_id, content, prompt, response, data, source_name)
-                    return data
-            _log_to_file(chunk_id, content, prompt, response, None, source_name)
-            logger.warning(f"Unparseable response for {chunk_id} (attempt {attempt+1}): {response[:100]}")
+            data = _parse_text_response(response)
+            _log_to_file(chunk_id, content, prompt, response, data, source_name)
+            if data and (data.get("entities") or data.get("edges")):
+                return data
+            if not data:
+                logger.warning(f"Unparseable response for {chunk_id} (attempt {attempt+1}): {response[:100]}")
         except Exception as e:
             logger.warning(f"Extraction error for {chunk_id} (attempt {attempt+1}): {e}")
         if attempt < max_retries:
@@ -358,6 +305,7 @@ async def extract_file_sequential(
     Returns the final graph state for this file.
     """
     state = KnowledgeGraphState()
+    failed_chunks = []
 
     for i, chunk in enumerate(chunks):
         content = chunk.get("content", "")
@@ -381,10 +329,27 @@ async def extract_file_sequential(
                 f"entities: {ent_names} | edges: {edge_types} | "
                 f"total: {len(state.entities)} entities, {len(state.edges)} edges"
             )
-        else:
-            logger.warning(f"  [{i+1}/{len(chunks)}] no data returned")
+            failed_chunks.append(i)
+            logger.warning(f"  [{i+1}/{len(chunks)}] no data returned (will retry)")
 
         await asyncio.sleep(0.5)
+
+    # Retry failed chunks once more
+    if failed_chunks:
+        logger.info(f"  {file_name}: retrying {len(failed_chunks)} failed chunks")
+        for i in failed_chunks:
+            chunk = chunks[i]
+            chunk_id = chunk["node_id"]
+            content = chunk.get("content", "")
+            await asyncio.sleep(2)
+            data = await _extract_chunk_with_context(llm_client, content, file_name, chunk_id, state)
+            if data:
+                new_ents = data.get("entities", [])
+                new_edges = data.get("edges", [])
+                state.update_from_extraction(new_ents, new_edges, chunk_id)
+                logger.info(f"  [{i+1}/{len(chunks)}] RETRY OK: +{len(new_ents)} entities, +{len(new_edges)} edges")
+            else:
+                logger.error(f"  [{i+1}/{len(chunks)}] RETRY FAILED — chunk lost")
 
     return state
 
@@ -472,35 +437,109 @@ def merge_file_states(
     return global_state
 
 
-def _parse_json_response(text: str) -> Any:
-    """Parse JSON from LLM response (may contain markdown wrapper)."""
+def _parse_text_response(text: str) -> Optional[Dict]:
+    """Parse text-format extraction response.
+
+    Format:
+    NEW: name | type | summary
+    UPD: name | type | updated summary
+    EDGE: source -> target | RELATIONSHIP | evidence_starts... evidence_ends
+
+    Resilient to truncation — each line is independent.
+    Also handles JSON fallback if LLM ignores text format instruction.
+    """
     text = text.strip()
 
+    # Remove markdown code blocks if present
     if text.startswith("```"):
         lines = text.split("\n")
         lines = [l for l in lines if not l.startswith("```")]
-        text = "\n".join(lines)
+        text = "\n".join(lines).strip()
 
+    entities = []
+    edges = []
+
+    # Try text format first
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+
+        if line.startswith(("NEW:", "UPD:")):
+            action = "create" if line.startswith("NEW:") else "update"
+            parts = line[4:].split("|")
+            if len(parts) >= 3:
+                entities.append({
+                    "name": parts[0].strip(),
+                    "type": parts[1].strip(),
+                    "summary": parts[2].strip(),
+                    "action": action,
+                    "confidence": 0.8,
+                })
+            elif len(parts) >= 2:
+                entities.append({
+                    "name": parts[0].strip(),
+                    "type": parts[1].strip(),
+                    "summary": "",
+                    "action": action,
+                    "confidence": 0.7,
+                })
+
+        elif line.startswith("EDGE:"):
+            rest = line[5:].strip()
+            # Parse: source -> target | TYPE | evidence
+            arrow_idx = rest.find("->")
+            if arrow_idx < 0:
+                continue
+            source = rest[:arrow_idx].strip()
+            after_arrow = rest[arrow_idx + 2:]
+            parts = after_arrow.split("|")
+            if len(parts) >= 2:
+                target = parts[0].strip()
+                edge_type = parts[1].strip()
+                evidence_starts = ""
+                evidence_ends = ""
+                if len(parts) >= 3:
+                    evidence = parts[2].strip()
+                    if "..." in evidence:
+                        ev_parts = evidence.split("...")
+                        evidence_starts = ev_parts[0].strip()
+                        evidence_ends = ev_parts[-1].strip()
+                edges.append({
+                    "source": source,
+                    "target": target,
+                    "type": edge_type,
+                    "weight": 0.8,
+                    "evidence_starts": evidence_starts,
+                    "evidence_ends": evidence_ends,
+                })
+
+    # If text parsing found something, return it
+    if entities or edges:
+        return {"entities": entities, "edges": edges}
+
+    # Fallback: try JSON parsing (LLM might ignore text format instruction)
     try:
-        return json.loads(text)
+        # Try to find JSON object
+        json_start = text.find("{")
+        json_end = text.rfind("}")
+        if json_start >= 0 and json_end > json_start:
+            data = json.loads(text[json_start:json_end + 1])
+            if isinstance(data, dict):
+                return data
     except json.JSONDecodeError:
         pass
 
-    for start_char, end_char in [("{", "}"), ("[", "]")]:
-        start = text.find(start_char)
-        if start == -1:
-            continue
-        depth = 0
-        for idx in range(start, len(text)):
-            if text[idx] == start_char:
-                depth += 1
-            elif text[idx] == end_char:
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start:idx + 1])
-                    except json.JSONDecodeError:
-                        break
+    # Try JSON array
+    try:
+        json_start = text.find("[")
+        json_end = text.rfind("]")
+        if json_start >= 0 and json_end > json_start:
+            data = json.loads(text[json_start:json_end + 1])
+            if isinstance(data, list) and data:
+                return data[0] if isinstance(data[0], dict) else None
+    except json.JSONDecodeError:
+        pass
 
-    logger.warning(f"Failed to parse JSON: {text[:200]}")
+    logger.warning(f"Failed to parse response: {text[:200]}")
     return None
