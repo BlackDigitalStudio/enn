@@ -380,11 +380,12 @@ Decide what to do next. Return ONLY valid JSON (no markdown):
 {{
   "add_to_scratchpad": "summarize the useful new information in 1-3 sentences",
   "sufficient": true/false,
-  "next_action": "explore:entity_name" or "read_chunk:chunk_id" or "answer"
+  "next_action": "explore:entity_name" or "search:keyword" or "read_chunk:chunk_id" or "answer"
 }}
 
 - "sufficient": true if you have enough to answer the question fully
 - "explore:name": follow edges of this entity to learn more
+- "search:keyword": search entities by name/keyword (use for direct lookups)
 - "read_chunk:id": load full chunk text for details
 - "answer": you have enough, generate the final answer"""
 
@@ -521,6 +522,16 @@ async def agent_query(request: AgentQueryRequest):
             matches = s.search_entities_by_name(entity_name, limit=3)
             found_entities = matches
             all_sources.extend(matches)
+        elif next_action.startswith("search:"):
+            keyword = next_action[7:]
+            matches = s.search_entities_by_name(keyword, limit=10)
+            if matches:
+                found_entities = matches
+                all_sources.extend(matches)
+                search_info = "\n".join([f"- {m['name']} [{m['type']}]: {m.get('summary', '')}" for m in matches])
+                scratchpad += f"\n[search '{keyword}'] found {len(matches)} entities:\n{search_info}"
+            else:
+                scratchpad += f"\n[search '{keyword}'] no results"
         elif next_action.startswith("read_chunk:"):
             chunk_id = next_action[11:]
             node = s.get_node(chunk_id)

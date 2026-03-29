@@ -191,20 +191,45 @@ class KnowledgeGraphState:
         self.entities: Dict[str, EntityState] = {}  # name → EntityState
         self.edges: List[EdgeState] = []
 
-    def format_for_prompt(self, max_entities: int = 50) -> str:
-        """Format existing entities for inclusion in extraction prompt."""
+    def format_for_prompt(self, chunk_text: str = "", max_entities: int = 50) -> str:
+        """Format existing entities for inclusion in extraction prompt.
+        Only includes entities whose names appear in the chunk text (keyword pre-filter).
+        Scales to 100K+ entities — prompt stays small regardless of graph size.
+        """
         if not self.entities:
             return "(empty — this is the first chunk)"
 
-        # Sort by confidence descending, take top N
-        sorted_ents = sorted(self.entities.values(), key=lambda e: -e.confidence)[:max_entities]
+        chunk_lower = chunk_text.lower() if chunk_text else ""
+
+        if chunk_lower:
+            # Only include entities mentioned in this chunk
+            relevant = [ent for ent in self.entities.values()
+                        if ent.name in chunk_lower]
+            # Always include high-confidence entities (categories, key characters)
+            if len(relevant) < 5:
+                top = sorted(self.entities.values(), key=lambda e: -e.confidence)[:10]
+                seen = {e.name for e in relevant}
+                for ent in top:
+                    if ent.name not in seen:
+                        relevant.append(ent)
+        else:
+            relevant = sorted(self.entities.values(), key=lambda e: -e.confidence)[:max_entities]
+
+        relevant = relevant[:max_entities]
+
+        if not relevant:
+            return "(no matching entities for this chunk)"
+
         lines = []
-        for ent in sorted_ents:
+        for ent in relevant:
             lines.append(f"- {ent.name} [{ent.type}]: {ent.summary}")
         return "\n".join(lines)
 
-    def update_from_extraction(self, entities: List[Dict], edges: List[Dict], chunk_id: str):
-        """Update state with extraction results from one chunk."""
+    def update_from_extraction(self, entities: List[Dict], edges: List[Dict], chunk_id: str) -> Dict[str, int]:
+        """Update state with extraction results from one chunk. Returns counts."""
+        new_count = 0
+        updated_count = 0
+
         for ent in entities:
             name = ent["name"].lower().strip()
             if not name:
@@ -215,6 +240,7 @@ class KnowledgeGraphState:
 
             if name in self.entities:
                 # Update existing
+                updated_count += 1
                 existing = self.entities[name]
                 if ent.get("summary"):
                     existing.summary = ent["summary"]
@@ -223,6 +249,7 @@ class KnowledgeGraphState:
                 existing.source_chunks.append(chunk_id)
             else:
                 # Create new
+                new_count += 1
                 self.entities[name] = EntityState(
                     name=name,
                     type=ent.get("type", "entity"),
@@ -267,6 +294,8 @@ class KnowledgeGraphState:
                     evidence_ends=evidence_ends,
                 ))
 
+        return {"new": new_count, "updated": updated_count}
+
 
 async def _extract_chunk_with_context(
     llm_client,
@@ -278,7 +307,7 @@ async def _extract_chunk_with_context(
 ) -> Optional[Dict]:
     """Extract entities from one chunk, with context of existing graph state."""
 
-    existing = graph_state.format_for_prompt()
+    existing = graph_state.format_for_prompt(chunk_text=content)
 
     if graph_state.entities:
         prompt = CONTEXT_EXTRACTION_PROMPT.format(
@@ -344,11 +373,11 @@ async def extract_file_sequential(
         if data:
             new_ents = data.get("entities", [])
             new_edges = data.get("edges", [])
-            state.update_from_extraction(new_ents, new_edges, chunk_id)
+            counts = state.update_from_extraction(new_ents, new_edges, chunk_id)
             ent_names = [e.get("name", "?") for e in new_ents[:5]]
             edge_types = [e.get("type", "?") for e in new_edges[:3]]
             logger.info(
-                f"  [{i+1}/{len(chunks)}] +{len(new_ents)} entities, +{len(new_edges)} edges | "
+                f"  [{i+1}/{len(chunks)}] {counts['new']} new + {counts['updated']} updated entities, +{len(new_edges)} edges | "
                 f"entities: {ent_names} | edges: {edge_types} | "
                 f"total: {len(state.entities)} entities, {len(state.edges)} edges"
             )
